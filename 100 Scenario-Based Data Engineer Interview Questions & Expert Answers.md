@@ -1,17 +1,19 @@
-# 100 Scenario-Based Data Engineer Interview Questions & Expert Answers
+# Data Engineer Scenario-Based Interview Guide (137 Questions with Answers)
 
-> **Author / Reference**: Vinesh Diddi – Data Engineer  
-> **Topic**: Real-World Problem Solving, Data Pipelines, Apache Spark, Lakehouse, Streaming, SQL, and Distributed Systems.
+> **Topic**: Real-world problem solving: data pipelines, Apache Spark, lakehouse (Delta / Hudi / Iceberg), streaming, AWS data services, SQL, Airflow, and distributed systems.
+> **Coverage**: Q1 to Q100 (core scenarios, corrected and updated), Q101 to Q137 (additional day-to-day scenarios), plus an answer framework.
 
 ---
 
-## 📑 Quick Navigation
+## Quick Navigation
 
 - [Questions 1 – 20: Spark Tuning, Shuffling, Ingestion & Lakehouse Architecture](#questions-1--20)
-- [Questions 21 – 40: Streaming, Aggregations, Failures, SCD & Linage](#questions-21--40)
+- [Questions 21 – 40: Streaming, Aggregations, Failures, SCD & Lineage](#questions-21--40)
 - [Questions 41 – 60: Scalability, Security, Joins, Transformations & Reusability](#questions-41--60)
 - [Questions 61 – 80: High-Throughput Ingestion, Medallion Architecture & Optimization](#questions-61--80)
 - [Questions 81 – 100: Kafka Streaming, Multi-Tenancy, Data Quality & End-to-End Projects](#questions-81--100)
+- [Questions 101 – 137: Additional Real-World Scenarios](#questions-101--137)
+- [How to Structure Scenario Answers](#how-to-structure-scenario-answers)
 
 ---
 
@@ -24,7 +26,7 @@
    * **Event Timeline & Task Metrics**: Compare the Min, Median, 75th percentile, and Max task durations. A large variance between Median and Max signals **Data Skew**.
    * **Shuffle Read / Write**: Check total shuffle volume. High shuffle read/write indicates expensive wide transformations (`groupByKey`, sort-merge joins).
    * **Spill (Memory) and Spill (Disk)**: Identifies executors running out of RAM during shuffles/aggregations and spilling to disk.
-   * **Executors Tab**: Check GC (Garbage Collection) time. If GC time $> 10-15\%$ of task time, the JVM is thrashing memory.
+   * **Executors Tab**: Check GC (Garbage Collection) time. If GC time above 10-15% of task time, the JVM is thrashing memory.
 2. **Driver vs Executor Logs**: Look for serialization bottlenecks, large unbroadcasted variables, or network timeout warnings in CloudWatch/YARN.
 3. **Storage I/O**: Check if reading millions of small files from S3 or if partition pruning is missing.
 
@@ -32,59 +34,60 @@
 
 ### Q2. A dataset contains millions of duplicate records. How would you remove them efficiently?
 **A:**  
-1. **PySpark Window Functions (Keeping Latest State)**:
+1. **Keep the latest record per key (deterministic)**:
    ```python
    from pyspark.sql.window import Window
    from pyspark.sql.functions import col, row_number
 
-   window_spec = Window.partitionBy("entity_id").orderBy(col("event_timestamp").desc())
+   window_spec = Window.partitionBy("entity_id").orderBy(col("event_timestamp").desc(), col("ingest_ts").desc())
    deduped_df = df.withColumn("rn", row_number().over(window_spec)).filter(col("rn") == 1).drop("rn")
    ```
-2. **Built-in `dropDuplicates`**:
+   Add a tiebreaker column so the result is the same on every run.
+2. **Exact duplicates (any copy is fine)**:
    ```python
-   # Only shuffles on the distinct keys, utilizing map-side combining
-   deduped_df = df.dropDuplicates(["entity_id"])
+   deduped_df = df.dropDuplicates()                 # whole-row duplicates
+   deduped_df = df.dropDuplicates(["entity_id"])    # keeps an ARBITRARY row per key
    ```
-3. **Storage Layer Deduplication (Lakehouse Upsert)**:
-   * Load data into Delta Lake / Apache Hudi / Iceberg using `MERGE INTO target USING staging ON target.id = staging.id`.
-
+   Use the key-subset form only when it does not matter which copy survives.
+3. **Storage-layer deduplication (Lakehouse upsert)**: Dedupe the source batch first, then `MERGE INTO target USING staging ON target.id = staging.id` in Delta Lake / Apache Hudi / Iceberg.
+4. **Efficiency**: Filter and select columns before deduplicating, and dedupe as early as possible so later stages shuffle less data.
 ---
 
 ### Q3. You have a large dataset and need to join it with a small lookup table. What approach would you use?
 **A:**  
 * **Approach**: **Broadcast Hash Join**.
-* **Mechanism**: Spark sends the entire small lookup table ($<100\text{ MB}$) to every executor node's memory.
-* **Benefit**: Completely eliminates the expensive wide shuffle stage and network data transfer, turning an $O(N \log N)$ shuffle sort-merge join into a local $O(N)$ hash lookup.
+* **Mechanism**: Spark sends the entire small lookup table to every executor's memory.
+* **Benefit**: Eliminates the shuffle of the large table, turning a sort-merge join into a local hash lookup per partition.
+* **Sizing**: The default `spark.sql.autoBroadcastJoinThreshold` is 10 MB. You can raise it (commonly up to a few hundred MB, depending on executor memory), force it with a hint, or let AQE convert the join at runtime when it discovers one side is small after filtering.
 * **Code**:
   ```python
   from pyspark.sql.functions import broadcast
   result_df = large_df.join(broadcast(small_lookup_df), "lookup_id", "left")
   ```
-
 ---
 
 ### Q4. Your Spark job is causing excessive shuffling. How would you optimize it?
 **A:**  
-1. **Replace `groupByKey()` with `reduceByKey()` / `aggregateByKey()`**: Enables map-side combining before network transfer.
-2. **Leverage Broadcast Joins**: Broadcast small dimension tables ($< 100\text{ MB}$) using `broadcast(df)`.
-3. **Pre-partition on Join/Grouping Keys**: If the dataset is reused across multiple operations, use `df.repartition("join_key")` or persist with partitioning.
-4. **Filter & Project Early**: Drop unused columns (`df.select(...)`) and filter rows before join/grouping operations.
-5. **Enable Adaptive Query Execution (AQE)**: Set `spark.sql.adaptive.enabled=true` to automatically coalesce shuffle partitions at runtime.
-
+1. **Filter & Project Early**: Drop unused columns (`df.select(...)`) and filter rows before joins and aggregations.
+2. **Leverage Broadcast Joins**: Broadcast small dimension tables with `broadcast(df)`.
+3. **Use partial aggregation**: DataFrame/SQL aggregations (`groupBy().agg()`) already combine map-side. In RDD code, use `reduceByKey` / `aggregateByKey` instead of `groupByKey`.
+4. **Reuse partitioning**: If a dataset is joined or grouped repeatedly on the same key, repartition once on that key (or bucket the table) and reuse it. A repartition is itself a shuffle, so it only pays off when reused.
+5. **Enable Adaptive Query Execution (AQE)**: `spark.sql.adaptive.enabled=true` (default in Spark 3.2+) coalesces shuffle partitions, switches join strategies, and handles skew at runtime.
+6. **Remove unnecessary wide operations**: Avoid repeated `distinct`, `orderBy`, and `repartition` calls that are not needed.
 ---
 
 ### Q5. A streaming pipeline is producing late-arriving data. How would you handle it?
 **A:**  
-1. **Event Time vs Processing Time**: Always base partition paths and windowed aggregations on the payload's source event timestamp, never the pipeline's ingestion clock.
+1. **Event Time vs Processing Time**: Base partition paths and windowed aggregations on the payload's event timestamp, never the pipeline's ingestion clock.
 2. **Watermarking in Spark Structured Streaming**:
    ```python
    streaming_df.withWatermark("event_time", "2 hours") \
        .groupBy(window("event_time", "10 minutes"), "user_id") \
        .count()
    ```
-   *Watermark defines the threshold beyond which late data is dropped or routed to a side DLQ.*
-3. **Dynamic Partition Routing & Lakehouse Upserts**: Route late events dynamically into historical S3 date partitions using Delta Lake/Hudi `MERGE INTO`, safely updating historical aggregations without duplicates.
-
+   The watermark tells Spark how long to keep state; events older than the watermark are **dropped from the aggregation**. Spark does not send them to a DLQ by itself.
+3. **Do not lose late events**: Write every raw event to the bronze layer *before* aggregating (or split late rows in `foreachBatch` by comparing event time to the current watermark and write them to a late-data table).
+4. **Correct the history**: Reprocess affected windows/partitions from bronze, or `MERGE INTO` the Delta/Hudi/Iceberg aggregate table so late data updates historical results without duplicates.
 ---
 
 ### Q6. Your data pipeline needs to process 1TB of data daily. How would you design it?
@@ -114,11 +117,10 @@
 
 ### Q8. A business team requires near real-time dashboards. What architecture would you design?
 **A:**  
-* **Ingestion**: Amazon Kinesis Data Streams / Apache Kafka captures live operational events.
-* **Streaming Engine**: Apache Flink (Kinesis Data Analytics) or Spark Structured Streaming processes 1-minute windowed aggregations.
-* **Serving Layer**: Stream aggregated metrics directly into **Amazon Redshift** (with Auto-refreshing Materialized Views) or **Amazon Timestream / ClickHouse / DynamoDB**.
-* **Visualization**: **Amazon QuickSight** or Grafana configured with direct-query mode or SPICE fast-refresh.
-
+* **Ingestion**: Amazon Kinesis Data Streams / Amazon MSK (Kafka) captures live operational events.
+* **Streaming Engine**: Amazon Managed Service for Apache Flink (formerly Amazon Managed Service for Apache Flink) or Spark Structured Streaming computes 1-minute windowed aggregations.
+* **Serving Layer**: Stream aggregated metrics into **Amazon Redshift** (streaming ingestion with auto-refreshing materialized views), **Amazon OpenSearch**, **ClickHouse**, or **DynamoDB**. For time-series metrics use Amazon Timestream for InfluxDB (Timestream for LiveAnalytics is closed to new customers).
+* **Visualization**: **Amazon QuickSight** (direct query or SPICE with frequent refresh) or Grafana.
 ---
 
 ### Q9. Your pipeline needs to support schema evolution. How would you design for that?
@@ -144,8 +146,8 @@
 ### Q11. Your Spark job fails due to memory issues. What steps would you take?
 **A:**  
 1. **Identify Driver vs Executor Failure**:
-   * *Driver OOM*: Caused by `.collect()`, large broadcasts, or metadata overhead $\rightarrow$ Increase `spark.driver.memory` and write directly to S3.
-   * *Executor OOM / YARN Container Killed*: Caused by data skew, large shuffles, or memory leak $\rightarrow$ Increase `spark.executor.memory` and `spark.executor.memoryOverhead`.
+   * *Driver OOM*: Caused by `.collect()`, large broadcasts, or metadata overhead → Increase `spark.driver.memory` and write directly to S3.
+   * *Executor OOM / YARN Container Killed*: Caused by data skew, large shuffles, or memory leak → Increase `spark.executor.memory` and `spark.executor.memoryOverhead`.
 2. **Tune Partitioning**: Increase `spark.sql.shuffle.partitions` (e.g., from 200 to 1000+) to reduce partition data size per executor task.
 3. **Garbage Collection**: Enable G1GC garbage collector (`-XX:+UseG1GC`) to prevent GC thrashing.
 4. **Unpersist Caches**: Call `df.unpersist()` on intermediate DataFrames that are no longer needed.
@@ -154,12 +156,12 @@
 
 ### Q12. A dataset contains nested JSON structures. How would you flatten it?
 **A:**  
-* **Use PySpark built-in functions (`explode`, `from_json`, `col.*`)**:
+* **Use PySpark built-in functions (`from_json`, `explode_outer`, struct field access)**:
   ```python
-  from pyspark.sql.functions import col, explode
+  from pyspark.sql.functions import col, explode_outer
 
-  # Explode array of objects into individual rows
-  exploded_df = df.withColumn("item", explode(col("order_items")))
+  # Explode array of objects into rows. explode_outer keeps rows whose array is null or empty.
+  exploded_df = df.withColumn("item", explode_outer(col("order_items")))
 
   # Flatten struct attributes
   flat_df = exploded_df.select(
@@ -170,22 +172,27 @@
       col("item.quantity").alias("quantity")
   )
   ```
-
+* Plain `explode` silently drops rows with null or empty arrays, so use `explode_outer` unless you want that.
+* If the JSON arrives as a string column, parse it first with `from_json(col, schema)`.
 ---
 
 ### Q13. Your ETL job is producing too many small files. How would you fix it?
 **A:**  
 1. **Before Writing in Spark**:
-   * Use `df.coalesce(N)` to reduce the number of output partitions without triggering a full network shuffle.
-   * Use `df.repartition(N)` if data redistribution across keys is required.
-2. **Lakehouse Auto-Compaction**: Configure Delta Lake `OPTIMIZE` or Apache Hudi automated compaction jobs to periodically merge small delta files into optimal 128MB–256MB Parquet files.
-3. **Glue Max File Sizing**: Set `hoodie.parquet.max.file.size = 268435456` (256MB).
-
+   * Use `df.coalesce(N)` to reduce output partitions without a full shuffle.
+   * Use `df.repartition(N)` (or `repartition(N, "partition_col")`) when data must be redistributed evenly.
+   * Let AQE coalesce small shuffle partitions.
+2. **Table-format maintenance**:
+   * Delta Lake: `OPTIMIZE` (bin-packing) and optimized writes.
+   * Iceberg: `rewrite_data_files` procedure (or the Glue Data Catalog automatic compaction).
+   * Hudi: small-file handling at write time (`hoodie.parquet.small.file.limit`, `hoodie.parquet.max.file.size`), **clustering** to rewrite small files, and **compaction** for Merge-on-Read tables (merges log files into base files).
+3. **Target size**: 128 MB to 256 MB per file, e.g. `hoodie.parquet.max.file.size = 268435456`.
+4. **Fix the source**: Batch upstream writers (e.g. increase Firehose buffer size/interval) so tiny files are not created in the first place.
 ---
 
 ### Q14. A join operation is causing performance issues. What optimization strategies would you use?
 **A:**  
-1. **Broadcast Join**: For small-to-large table joins ($<100\text{ MB}$), force a broadcast join (`broadcast(small_df)`).
+1. **Broadcast Join**: For small-to-large table joins (under roughly 100 MB (tunable, default threshold 10 MB)), force a broadcast join (`broadcast(small_df)`).
 2. **Bucket & Sort on Join Keys**: Pre-bucket both datasets by the join key (`df.write.bucketBy(num_buckets, "join_key")`), enabling bucket-to-bucket joins without runtime shuffles.
 3. **Filter Early**: Filter nulls and irrelevant rows before joining.
 4. **Mitigate Skew**: Use key salting if specific join keys contain disproportionate data volume.
@@ -207,10 +214,9 @@
 ### Q16. A pipeline processes streaming clickstream data. How would you store and analyze it?
 **A:**  
 1. **Ingestion**: Amazon Kinesis Data Streams / Kafka captures JSON clickstream events.
-2. **Streaming Ingestion**: Kinesis Firehose or Spark Structured Streaming converts streams into columnar Parquet and commits them into an S3 Bronze lake partitioned by `date/hour`.
-3. **Real-Time Aggregations**: Spark Structured Streaming computes tumbling window metrics (active sessions, CTR per minute) and streams to Redis / DynamoDB.
+2. **Streaming Ingestion**: Amazon Data Firehose or Spark Structured Streaming converts streams into columnar Parquet and commits them into an S3 Bronze lake partitioned by `date/hour`.
+3. **Real-Time Aggregations**: Spark Structured Streaming or Flink computes tumbling window metrics (active sessions, CTR per minute) and writes to Redis / DynamoDB.
 4. **Historical Analytics**: S3 Parquet partitions are queried directly using Amazon Athena and Redshift Spectrum.
-
 ---
 
 ### Q17. A dataset contains inconsistent schema across files. How would you handle it?
@@ -247,33 +253,35 @@
 
 ### Q19. A table has billions of rows and queries are slow. How would you optimize query performance?
 **A:**  
-1. **Partition Pruning**: Ensure queries filter on physical partition columns (e.g., `date`, `region`).
-2. **Columnar Storage with Snappy Compression**: Store as Parquet/ORC so query engines scan only referenced columns.
-3. **Z-Ordering / Clustering**: Use Delta Lake / Iceberg `OPTIMIZE ZORDER BY (frequently_queried_column)` to collocate multidimensional data.
-4. **Data Warehouse Indexing**: In Amazon Redshift, configure optimal `DISTKEY` (join key) and `COMPOUND SORTKEY` (filter keys).
+1. **Partition Pruning**: Ensure queries filter on physical partition columns (e.g., `date`).
+2. **Columnar Storage with Compression**: Store as Parquet/ORC so engines scan only referenced columns.
+3. **Clustering / Z-Ordering** (syntax depends on the format):
+   * Delta Lake: `OPTIMIZE tbl ZORDER BY (col)`
+   * Iceberg: `CALL system.rewrite_data_files(table => 'db.tbl', strategy => 'sort', sort_order => 'zorder(col1,col2)')`
+   * Hudi: clustering with sort / space-filling-curve strategies
+4. **Data Warehouse Keys**: In Amazon Redshift, choose a `DISTKEY` on the common join column and a `SORTKEY` on common filter columns (or use `AUTO` and let Redshift decide).
 5. **Materialized Views**: Precompute heavy aggregations.
-
+6. **Read the plan**: Use `EXPLAIN` / Spark UI to confirm pruning and pushdown actually happen.
 ---
 
 ### Q20. How would you design a partitioning strategy for a large dataset?
 **A:**  
-1. **Select High-Cardinality Query Filter Keys**: Partition by date (`year=YYYY/month=MM/day=DD`) or category (`region=US`).
-2. **Target File Sizes of 128MB to 256MB**: Ensure each partition directory contains substantial data volume.
-3. **Avoid Over-Partitioning**: Avoid partitioning by timestamp to the minute or high-cardinality IDs (`user_id`), which produces millions of tiny KB files (Small File Problem).
-4. **Implement Dynamic Partition Routing**: Use dynamic partition overwrite mode in PySpark to write into target partition folders without wiping historical partitions.
-
+1. **Partition on low-to-moderate cardinality columns that appear in most filters**: usually a date (`year/month/day`) and sometimes a category such as `region`.
+2. **Target at least ~128 MB per partition** (ideally 128 MB to 256 MB files): every partition directory should hold substantial data.
+3. **Avoid Over-Partitioning**: Do not partition by minute-level timestamps or high-cardinality IDs (`user_id`), which creates millions of tiny files and slow catalog listings.
+4. **High-cardinality filter columns** (user_id, device_id) are handled with bucketing, sort order / Z-order / clustering, or table-format indexes, not partitions.
+5. **Dynamic partition overwrite**: `spark.sql.sources.partitionOverwriteMode=dynamic` replaces only the partitions present in the DataFrame, leaving other partitions untouched. Every touched partition is replaced **completely**, so the DataFrame must hold the full contents of those partitions.
 ---
 
 ## Questions 21 – 40
 
 ### Q21. How would you ensure fault tolerance in a distributed data pipeline?
 **A:**  
-1. **Pipeline Idempotency**: Design write operations using Lakehouse `MERGE INTO` or dynamic partition overwrites so re-executing failed batches never creates duplicate rows.
-2. **Checkpointing & State Recovery**: Use Spark Structured Streaming checkpoints in S3 to persist offset progress.
-3. **Automated Retries**: Configure exponential backoff retries in Apache Airflow (`retries=3`, `retry_delay=timedelta(minutes=5)`).
-4. **Decoupled Architecture**: Use durable distributed message brokers (Kafka/SQS) that persist messages during consumer downtime.
+1. **Pipeline Idempotency**: Design writes using Lakehouse `MERGE INTO` or full-partition overwrites so re-executing failed batches never creates duplicate rows.
+2. **Checkpointing & State Recovery**: Use Spark Structured Streaming checkpoints in S3 to persist offset and state progress.
+3. **Automated Retries**: Configure retries with exponential backoff in Apache Airflow (`retries=3`, `retry_delay=timedelta(minutes=5)`, `retry_exponential_backoff=True`).
+4. **Decoupled Architecture**: Use durable message brokers (Kafka/Kinesis/SQS) that persist messages during consumer downtime.
 5. **Dead Letter Queues (DLQ)**: Isolate bad records into quarantine storage without halting the main pipeline.
-
 ---
 
 ### Q22. Your Spark job produces incorrect aggregations. How would you debug it?
@@ -288,29 +296,32 @@
 
 ### Q23. A streaming pipeline needs exactly-once processing. How would you implement it?
 **A:**  
-"While exactly-once network delivery is impossible, an **Exactly-Once Processing Effect** is achieved via:
-1. **Replay-able Source**: Kafka/Kinesis retaining message offsets.
-2. **Stateful Streaming Engine**: Spark Structured Streaming / Apache Flink with checkpointing and Write-Ahead Logs (WAL).
-3. **Idempotent Sink**:
-   * Delta Lake / Apache Hudi utilizing unique transaction IDs in `MERGE INTO`.
+"True exactly-once delivery over a network is not achievable; what we achieve is an **exactly-once processing effect**:
+1. **Replayable Source**: Kafka/Kinesis retaining offsets so data can be re-read after failure.
+2. **Stateful Engine with Checkpointing**: Spark Structured Streaming records offsets in its checkpoint offset log and commit log; Apache Flink uses distributed checkpoints (with two-phase-commit sinks where supported).
+3. **Idempotent or Transactional Sink**:
+   * Delta Lake / Hudi / Iceberg commits are atomic. In `foreachBatch`, use a deterministic `MERGE INTO` on a unique event ID (or Delta's `txnAppId`/`txnVersion` idempotent-write options) so a replayed batch has no extra effect.
    * Relational database upserts with `UNIQUE` constraints on message IDs."
-
 ---
 
 ### Q24. Your ETL pipeline requires data validation rules. How would you implement them?
 **A:**  
 1. **Metadata-Driven Rule Framework**: Define validation rules in a configuration table (e.g., `not_null`, `range_check`, `regex_match`).
-2. **Dynamic PySpark Rule Engine**:
+2. **PySpark Rule Engine** (NULL-safe, so no row is lost):
    ```python
-   # Dynamic check for validation rules
-   valid_df = df.filter("price > 0 AND customer_id IS NOT NULL")
-   invalid_df = df.filter("price <= 0 OR customer_id IS NULL")
+   from pyspark.sql import functions as F
 
-   # Route invalid rows to DLQ
+   rule     = (F.col("price") > 0) & F.col("customer_id").isNotNull()
+   is_valid = F.coalesce(rule, F.lit(False))      # NULL result counts as invalid
+
+   valid_df   = df.filter(is_valid)
+   invalid_df = df.filter(~is_valid)              # exact complement of valid_df
+
    invalid_df.write.parquet("s3://lake/dlq/reason=validation_failure/")
+   # Reconciliation check: valid_df.count() + invalid_df.count() == df.count()
    ```
-3. **Integration with Tools**: Implement **Great Expectations** or **AWS Glue Data Quality** for automated pre/post-load assertion checks.
-
+   Filtering with two separate conditions can drop rows whose columns are NULL (three-valued logic), which is why the complement form is used.
+3. **Integration with Tools**: **Great Expectations** or **AWS Glue Data Quality** for automated pre/post-load assertions.
 ---
 
 ### Q25. A data pipeline fails due to schema mismatch. How would you handle it?
@@ -325,17 +336,25 @@
 ### Q26. Your Spark job is generating huge shuffle files. How would you reduce them?
 **A:**  
 1. **Filter and Select Columns Early**: Drop unnecessary columns before joins and aggregations to reduce byte volume.
-2. **Replace `groupByKey` with `reduceByKey`**: Applies map-side combining to aggregate data prior to network transmission.
-3. **Tune Shuffle Partition Count**: Set `spark.sql.shuffle.partitions` appropriately to match cluster core counts.
-4. **Use Broadcast Joins**: Eliminate shuffles entirely for small lookup tables.
-5. **Enable Shuffle File Compression**: Set `spark.shuffle.compress=true` and `spark.io.compression.codec=lz4`.
-
+2. **Aggregate before shuffling**: DataFrame aggregations do this automatically; in RDD code use `reduceByKey` instead of `groupByKey`.
+3. **Tune Shuffle Partition Count**: Set `spark.sql.shuffle.partitions` appropriately (about 2 to 4 tasks per core, and partitions of roughly 100 to 200 MB), or rely on AQE coalescing.
+4. **Use Broadcast Joins**: Eliminate shuffles for small lookup tables.
+5. **Compression**: Shuffle compression is on by default (`spark.shuffle.compress=true`, lz4). `zstd` (`spark.io.compression.codec=zstd`) gives a better ratio at some CPU cost.
+6. **Fix skew**: One huge key produces one huge shuffle block; use AQE skew handling or salting.
 ---
 
 ### Q27. You need to merge incremental data into a data warehouse table. How would you design it?
 **A:**  
-1. **Staging Table Load**: Ingest incremental delta files into a transient staging table in Amazon Redshift / Snowflake.
-2. **Atomic Merge Transaction**:
+1. **Staging Table Load**: Load incremental delta files into a transient staging table in Amazon Redshift / Snowflake (for Redshift use `COPY` from S3).
+2. **Option A, native MERGE** (supported in Redshift and Snowflake):
+   ```sql
+   MERGE INTO target_table
+   USING staging_table s
+   ON target_table.id = s.id
+   WHEN MATCHED THEN UPDATE SET col1 = s.col1, col2 = s.col2
+   WHEN NOT MATCHED THEN INSERT (id, col1, col2) VALUES (s.id, s.col1, s.col2);
+   ```
+3. **Option B, delete + insert in one transaction**:
    ```sql
    BEGIN TRANSACTION;
    DELETE FROM target_table
@@ -346,18 +365,18 @@
    SELECT * FROM staging_table;
    END TRANSACTION;
    ```
-3. **Lakehouse Alternative**: In Delta Lake / Hudi, execute standard `MERGE INTO target USING staging ON target.id = staging.id WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT`.
-
+4. **Lakehouse Alternative**: In Delta Lake / Hudi / Iceberg, run `MERGE INTO target USING staging ON target.id = staging.id WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *`.
+5. Deduplicate the staging data by key first so the merge is deterministic.
 ---
 
 ### Q28. Your pipeline requires historical tracking of changes. How would you implement SCD Type 2?
 **A:**  
-* **Schema Design**: Include audit columns: `start_date`, `end_date`, `is_current_flag`, `surrogate_key`.
+* **Schema Design**: Include `surrogate_key`, `start_date`, `end_date`, `is_current_flag`, and optionally a `row_hash` of the tracked attributes.
 * **PySpark / SQL Implementation**:
-  1. Identify new records $\rightarrow$ Insert with `start_date = current_date`, `end_date = '9999-12-31'`, `is_current = 'Y'`.
-  2. Identify changed records $\rightarrow$ Update existing active row setting `end_date = current_date` and `is_current = 'N'`, then insert a new row with updated values, `start_date = current_date`, `end_date = '9999-12-31'`, and `is_current = 'Y'`.
-  3. Execute via a single atomic Lakehouse / Warehouse `MERGE` statement.
-
+  1. New records: insert with `start_date = current_date`, `end_date = '9999-12-31'`, `is_current = 'Y'`.
+  2. Changed records (row hash differs): update the active row with `end_date = current_date` and `is_current = 'N'`, then insert a new active row with the new values.
+  3. In one atomic `MERGE`, stage changed rows twice: once with the real key (to expire the old row) and once with a NULL merge key (so it falls into the insert branch).
+* Use the event's effective date, not the load date, if history must be point-in-time accurate.
 ---
 
 ### Q29. A batch job runs for 6 hours. How would you reduce the runtime?
@@ -380,18 +399,19 @@
 
 ### Q31. A business team needs hourly data refresh. How would you schedule pipelines?
 **A:**  
-1. **Airflow MWAA Scheduling**: Set cron expression `@hourly` (`0 * * * *`) with `catchup=False`.
-2. **S3 Event-Driven Triggers**: Use Amazon EventBridge + AWS Lambda to trigger the Airflow DAG immediately upon hourly file delivery in S3.
-3. **Partition Alignment**: Organize output S3 paths by `/year=YYYY/month=MM/day=DD/hour=HH/` to enable rapid incremental loads into Redshift.
-
+1. **Airflow (MWAA) Scheduling**: Set `schedule="@hourly"` (cron `0 * * * *`; `schedule_interval` is the legacy argument name) with `catchup=False`.
+2. **Event-Driven Triggers**: Use Amazon EventBridge + AWS Lambda to trigger the Airflow DAG (via the MWAA API) as soon as the hourly file lands in S3.
+3. **Partition Alignment**: Organize output S3 paths by `/year=YYYY/month=MM/day=DD/hour=HH/` to enable fast incremental loads into Redshift.
+4. Make each run idempotent and parameterized by the data interval, so reruns and delays are safe.
 ---
 
 ### Q32. Your Spark cluster resources are underutilized. How would you improve utilization?
 **A:**  
-1. **Enable Dynamic Resource Allocation**: Set `spark.dynamicAllocation.enabled=true` so executors scale up during compute-heavy stages and terminate during idle periods.
-2. **Adjust Partition Count**: If partition count is too low ($< \text{available cores}$), cores sit idle. Increase `spark.default.parallelism` to $2\times\text{--}3\times$ total cores.
-3. **Right-Size Worker Types**: Switch from memory-heavy to compute-optimized worker types if CPU is saturated while memory sits empty.
-
+1. **Check task count vs cores in the Spark UI**: If a stage has fewer tasks than cores, cores sit idle.
+2. **Adjust Partition Count**: For DataFrame/SQL jobs raise `spark.sql.shuffle.partitions` or `repartition` before the heavy stage, and check input split size (`spark.sql.files.maxPartitionBytes`). Aim for 2 to 4 tasks per core. (`spark.default.parallelism` only affects RDD operations.)
+3. **Enable Dynamic Resource Allocation**: `spark.dynamicAllocation.enabled=true` so executors scale with load (Glue: use Auto Scaling).
+4. **Right-Size Worker Types**: Switch worker/instance types when CPU is saturated while memory sits idle, or the reverse.
+5. **Fix skew**: One long task keeps the whole stage (and cluster) waiting.
 ---
 
 ### Q33. A dataset contains corrupt records. How would you detect and handle them?
@@ -415,10 +435,9 @@
 
 ### Q34. You need to process logs from multiple sources. How would you design ingestion?
 **A:**  
-1. **Collection**: Deploy FluentBit / Amazon CloudWatch Agents to forward server logs into **Amazon Kinesis Data Firehose**.
-2. **Partitioning on Ingestion**: Firehose automatically buffers, compresses (GZIP/Snappy), and writes raw log objects to S3 partitioned by source type and timestamp (`/source_name/YYYY/MM/DD/HH/`).
-3. **ETL Standardization**: Scheduled Glue PySpark jobs parse JSON/syslog regex patterns, extract structured dimensions, and load into an Amazon OpenSearch / Athena data lake.
-
+1. **Collection**: Deploy Fluent Bit / Amazon CloudWatch Agent to forward server logs to **Amazon Data Firehose** (formerly Amazon Data Firehose).
+2. **Partitioning on Ingestion**: Firehose buffers, compresses (GZIP/Snappy), and writes objects to S3. Use **dynamic partitioning** (or one delivery stream per source) to get prefixes like `/source_name/YYYY/MM/DD/HH/`.
+3. **ETL Standardization**: Scheduled Glue PySpark jobs parse JSON/syslog patterns, extract structured fields, and write Parquet for Athena, or index into Amazon OpenSearch for search and dashboards.
 ---
 
 ### Q35. Your Spark job fails intermittently. How would you troubleshoot?
@@ -440,12 +459,12 @@
 
 ### Q37. A large dataset must be queried interactively. What storage format would you choose?
 **A:**  
-* **Format**: **Apache Iceberg / Delta Lake on Parquet with Z-Order Clustering**.
+* **Format**: **Apache Iceberg (or Delta Lake) on Parquet, with sort/Z-order clustering on the common filter columns**.
 * **Rationale**:
-  * Columnar layout provides extreme compression and column projection.
-  * Z-Ordering / Min-Max file statistics enable query engines (Athena, Starburst, Presto) to skip 90%+ of non-matching data files.
-  * Snapshot isolation ensures high-concurrency read queries never conflict with ongoing writes.
-
+  * Columnar layout gives strong compression and column projection.
+  * Partitioning plus min/max file statistics (and Z-order/sort clustering) let engines such as Athena, Trino/Starburst, and Spark skip most non-matching files.
+  * Snapshot isolation lets readers run while writers commit.
+* Z-order syntax differs by format (Delta `OPTIMIZE ... ZORDER BY`, Iceberg `rewrite_data_files` with a `zorder` sort order); Athena's Iceberg `OPTIMIZE` only bin-packs files.
 ---
 
 ### Q38. Your pipeline must support both batch and streaming. How would you design it?
@@ -459,19 +478,18 @@
 
 ### Q39. A job frequently fails due to executor loss. What would you investigate?
 **A:**  
-1. **Executor Memory Overruns (OOM / YARN Killed)**: Check if executor memory + overhead exceeded container limits (`Exit code 137` / `Container killed by YARN for exceeding memory limits`).
-2. **Long GC Pauses**: JVM full GC freezes the executor, causing it to miss heartbeat intervals to the driver (`Heartbeat timed out after 120s`). Fix: Tune G1GC.
-3. **Spot Instance Rebalancing**: Cloud provider reclaiming spot instances. Fix: Use on-demand nodes for core drivers/executors.
-4. **Disk Full during Shuffles**: Massive intermediate shuffle spills exhausting executor local disk space.
-
+1. **Executor Memory Overruns**: Check whether executor memory + overhead exceeded the container limit. YARN reports "Container killed by YARN for exceeding memory limits" (usually exit code 143); a kernel/Kubernetes OOM kill shows exit code 137. Read the diagnostic message, not only the code.
+2. **Long GC Pauses**: A full GC can freeze an executor so it misses heartbeats (`Heartbeat timed out`, default network timeout 120 s). Tune G1GC and memory.
+3. **Spot Instance Reclamation**: Use on-demand nodes for the driver and critical executors, and enable decommissioning/graceful shutdown.
+4. **Disk Full during Shuffles**: Shuffle spill exhausting executor local disk.
 ---
 
 ### Q40. Your team needs to track data lineage. How would you implement it?
 **A:**  
-1. **OpenLineage / Apache Atlas**: Integrate Spark jobs with the **OpenLineage Spark listener**, which automatically captures dataset inputs, outputs, schemas, and job run metadata.
-2. **AWS Native Lineage**: Use **AWS Lake Formation** and **AWS Glue Data Catalog** lineage graphs.
-3. **Airflow Lineage**: Utilize Airflow's built-in `inlets` and `outlets` dataset tracking to visualize DAG-to-DAG dependencies.
-
+1. **OpenLineage**: Add the OpenLineage Spark listener (and the Airflow OpenLineage provider) so each job run emits inputs, outputs, schemas, and run metadata to a backend such as Marquez, DataHub, or Apache Atlas.
+2. **AWS-native option**: Amazon DataZone / the SageMaker catalog can capture lineage (including OpenLineage events). The Glue Data Catalog and Lake Formation handle metadata and permissions but do not draw lineage graphs.
+3. **Airflow**: `inlets`/`outlets` (Datasets, renamed Assets in Airflow 3) describe which tasks produce and consume data and drive data-aware scheduling.
+4. **Column-level lineage** needs a tool that parses SQL/Spark plans (OpenLineage facets, DataHub, dbt docs).
 ---
 
 ## Questions 41 – 60
@@ -487,53 +505,66 @@
 
 ### Q42. Your dataset contains PII data. How would you secure it?
 **A:**  
-1. **Encryption**: Enforce AWS KMS customer-managed key encryption at rest (`SSE-KMS`) and TLS 1.2+ in transit.
-2. **Tokenization / Hashing**: Mask or hash sensitive columns (`SHA-256(ssn)`) in the raw/silver layer before exposing data to analytics.
-3. **Granular Access Control**: Use **AWS Lake Formation** to enforce column-level security and row-level filtering based on IAM roles.
-4. **Automated Discovery**: Run **Amazon Macie** to discover and classify sensitive customer data in S3.
+1. **Encryption**: AWS KMS customer-managed keys at rest (`SSE-KMS`) and TLS 1.2+ in transit.
+2. **Tokenization / Keyed Hashing**: Replace sensitive values with tokens from a vault or token service, use format-preserving encryption, or use a keyed hash (HMAC-SHA256) with the key in AWS Secrets Manager/KMS. A plain unsalted `SHA-256(ssn)` is reversible by brute force because the input space is small.
+   ```python
+   import hmac, hashlib
+   from pyspark.sql import functions as F
 
+   KEY = get_secret("pii-hmac-key").encode()   # from Secrets Manager, never hardcoded
+
+   @F.udf("string")
+   def tokenize(v):
+       return hmac.new(KEY, v.encode(), hashlib.sha256).hexdigest() if v else None
+   ```
+3. **Granular Access Control**: **AWS Lake Formation** column-level permissions and row filters, with least-privilege IAM roles.
+4. **Discovery**: **Amazon Macie** to find and classify sensitive data in S3.
+5. **Governance**: Retention limits, audit logging (CloudTrail), and a process for deletion requests.
 ---
 
 ### Q43. A Spark job needs to process millions of small JSON files. How would you optimize it?
 **A:**  
-1. **Combine Files on Read**:
+1. **Group files on read (AWS Glue)**:
    ```python
-   # Set max partition split size in Spark
-   spark.conf.set("spark.sql.files.maxPartitionBytes", "134217728") # 128MB
-   df = spark.read.json("s3://bucket/path/*.json")
+   dyf = glueContext.create_dynamic_frame.from_options(
+       connection_type="s3",
+       connection_options={"paths": ["s3://bucket/raw/"], "recurse": True,
+                           "groupFiles": "inPartition", "groupSize": "134217728"},  # 128 MB
+       format="json")
    ```
-2. **Pre-Compaction via Glue**: Run an AWS Glue job or Amazon EMR S3DistCp to merge tiny JSON files into larger bundled files.
-3. **Direct Lakehouse Ingestion**: Ingest raw files directly into Delta Lake using Auto Loader (`cloudFiles`), which automatically handles millions of small files efficiently.
-
+2. **Plain Spark**: Tune `spark.sql.files.maxPartitionBytes` and `spark.sql.files.openCostInBytes` so many small files pack into each task, and **provide an explicit schema** so Spark does not scan millions of files for schema inference.
+3. **Compact once**: Run a Glue job or EMR S3DistCp (`--groupBy`, `--targetSize`) to merge tiny files into larger Parquet files, and process the compacted data from then on.
+4. **Fix the producer**: Batch writes (e.g. larger Firehose buffer) so small files stop accumulating.
+5. (Databricks-only: Auto Loader `cloudFiles` handles this natively; it is not available in Glue/EMR.)
 ---
 
 ### Q44. How would you implement idempotent pipelines?
 **A:**  
-1. **Deterministic Primary Keys & Lakehouse Upserts**: Use `MERGE INTO target USING staging ON target.id = staging.id`.
-2. **Dynamic Partition Overwrite**:
+1. **Deterministic Keys & Lakehouse Upserts**: `MERGE INTO target USING staging ON target.id = staging.id`, with the staging data deduplicated by key.
+2. **Full-Partition Dynamic Overwrite**:
    ```python
    spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
    df.write.mode("overwrite").partitionBy("date").parquet("s3://bucket/path/")
    ```
-3. **Deduplication Key Table**: Record batch/event IDs in a transactional database table to prevent re-processing identical execution batches.
-
+   Safe only when `df` contains the complete data for every partition it touches.
+3. **Batch Tracking Table**: Record batch/event IDs in a transactional table to skip batches already applied.
+4. **Parameterize by data interval**, not by "now", so reruns produce the same output.
 ---
 
 ### Q45. Your data warehouse queries are slow. How would you optimize them?
 **A:**  
-1. **Review Distribution & Sort Keys (Redshift)**: Ensure joining tables share identical `KEY` distribution, small tables use `ALL`, and filtered columns are defined as `SORTKEY`.
-2. **Run Maintenance**: Execute `VACUUM` and `ANALYZE` to reclaim space and update query planner statistics.
-3. **Enable Concurrency Scaling & WLM**: Configure separate Workload Management queues for ETL vs reporting queries.
-4. **Create Materialized Views**: Precompute heavy aggregations for repetitive dashboard queries.
-
+1. **Review Distribution & Sort Keys (Redshift)**: Join tables on a shared `DISTKEY`, use `DISTSTYLE ALL` for small dimensions, and sort on filtered columns (or `AUTO`, which Redshift tunes over time).
+2. **Statistics and Sorting**: Redshift runs auto-analyze and auto-vacuum, but after large loads check `SVV_TABLE_INFO` (`stats_off`, `unsorted`, `skew_rows`) and run `ANALYZE` / `VACUUM` where needed.
+3. **Workload Management**: Auto WLM or separate queues for ETL vs reporting, with Concurrency Scaling for peaks.
+4. **Materialized Views**: Precompute heavy aggregations for repeated dashboard queries.
+5. **Read the plan**: Look for `DS_BCAST_INNER` / `DS_DIST_BOTH` redistribution steps and fix with better distribution keys.
 ---
 
 ### Q46. A dataset arrives late from upstream systems. How would you handle dependencies?
 **A:**  
-1. **Sensors with Timeouts**: Use Airflow `ExternalTaskSensor` or `S3KeySensor` configured with `mode='reschedule'` and reasonable timeouts to avoid consuming worker slots while waiting.
-2. **Event-Driven Triggers**: Replace static cron schedules with Amazon EventBridge rules that trigger pipelines dynamically upon upstream file arrival.
-3. **SLA Monitoring & Fallbacks**: Configure `sla_miss_callback` to alert on-call engineers and execute downstream jobs with last-known-good datasets if data arrives past cutoff windows.
-
+1. **Sensors with Timeouts**: Use `S3KeySensor` / `ExternalTaskSensor` in `mode="reschedule"` (or deferrable operators) with sensible timeouts, so they do not hold worker slots.
+2. **Event-Driven Triggers**: Replace fixed cron timing with EventBridge rules that trigger the pipeline when the upstream file arrives.
+3. **SLA Monitoring & Fallbacks**: On Airflow 2.x use `sla_miss_callback`; in Airflow 3 (where SLAs were removed) use task timeouts plus CloudWatch or external monitors. Alert on-call, and if the business allows, run downstream jobs on the last-known-good data past the cutoff and mark the output as stale.
 ---
 
 ### Q47. Your pipeline needs automatic retries. How would you implement it?
@@ -553,12 +584,12 @@
 
 ### Q48. A Spark job reads data from S3 slowly. What optimizations would you try?
 **A:**  
-1. **Partition Pruning**: Ensure queries contain `WHERE` clauses filtering on partition prefix paths.
-2. **Increase Split Sizing**: Set `spark.sql.files.maxPartitionBytes=134217728` (128MB).
-3. **Avoid S3 Rate Throttling**: If hitting `503 Slow Down`, distribute file prefixes or increase S3 request limits.
-4. **Switch to Columnar Formats**: Replace CSV/JSON with Parquet/ORC to read only required columns.
-5. **Use AWS S3 Gateway VPC Endpoint**: Ensures traffic travels across dedicated AWS network backbones instead of traversing NAT Gateways.
-
+1. **Partition Pruning**: Filter on partition columns so only the needed prefixes are read.
+2. **Columnar Formats**: Parquet/ORC with predicate pushdown and column pruning instead of CSV/JSON.
+3. **File layout**: Fewer, larger files (128 MB to 256 MB), and tune `spark.sql.files.maxPartitionBytes`.
+4. **Avoid S3 throttling (`503 Slow Down`)**: S3 scales automatically per prefix (about 5,500 GET and 3,500 PUT requests per second per prefix); spread keys across prefixes, use fewer larger files, and retry with exponential backoff.
+5. **Committer and connector**: Use the EMRFS S3-optimized committer (EMR/Glue) or S3A committers, and tune connection-pool settings.
+6. **S3 Gateway VPC Endpoint**: Keeps traffic private and avoids NAT gateway data charges (a cost/security benefit rather than a speed-up).
 ---
 
 ### Q49. Your pipeline requires audit logging. How would you implement it?
@@ -571,45 +602,49 @@
 
 ### Q50. A dataset must support time-travel queries. How would you design it?
 **A:**  
-* **Implement Modern Table Format**: Use **Delta Lake** or **Apache Iceberg**.
+* **Use a Modern Table Format**: **Delta Lake**, **Apache Iceberg**, or Hudi.
 * **Query Historical Snapshots**:
   ```sql
   -- Query by timestamp
   SELECT * FROM item_inventory TIMESTAMP AS OF '2026-08-30 00:00:00';
 
-  -- Query by commit version
+  -- Query by commit/snapshot version
   SELECT * FROM item_inventory VERSION AS OF 42;
   ```
-* **Manage Retention**: Configure log retention (`vacuum` threshold) to balance historical time-travel window requirements against storage costs.
-
+  (Athena Iceberg syntax: `FOR TIMESTAMP AS OF` / `FOR VERSION AS OF`.)
+* **Manage Retention**: The time-travel window is bounded by retention settings. Delta: `delta.logRetentionDuration` (default 30 days) and `delta.deletedFileRetentionDuration` (default 7 days, enforced by `VACUUM`). Iceberg: `expire_snapshots`. Balance the window against storage cost.
 ---
 
 ### Q51. Your pipeline needs schema validation before processing. How would you implement it?
 **A:**  
-1. **Pre-Processing Gatekeeper**: Compare incoming DataFrame schema against an expected `StructType` definition:
+1. **Pre-Processing Gatekeeper**: Compare column names and data types, not the whole `StructType`, because `StructType` equality also compares nullability and metadata (files are usually read as all-nullable, which causes false mismatches):
    ```python
-   expected_schema = StructType([...])
-   if df.schema != expected_schema:
-       # Quarantine and alert
-       df.write.parquet("s3://lake/schema_mismatch_quarantine/")
-       raise ValueError("Schema mismatch detected")
-   ```
-2. **AWS Glue Schema Registry**: Enforce strict compatibility checks during schema deserialization.
+   def sig(schema):
+       return {(f.name.lower(), f.dataType.simpleString()) for f in schema.fields}
 
+   missing = sig(expected_schema) - sig(df.schema)
+   extra   = sig(df.schema) - sig(expected_schema)
+
+   if missing:                         # breaking change: quarantine and alert
+       df.write.parquet("s3://lake/schema_mismatch_quarantine/")
+       raise ValueError(f"Missing or changed columns: {missing}")
+   if extra:                           # additive change: allow and log
+       logger.warning("New columns detected: %s", extra)
+   ```
+2. **AWS Glue Schema Registry**: Enforce compatibility checks (BACKWARD/FULL) for streaming schemas.
 ---
 
 ### Q52. You need to process IoT streaming data. What architecture would you design?
 **A:**  
-1. **Ingestion**: **AWS IoT Core** ingests MQTT messages and forwards to **Amazon Kinesis Data Streams**.
-2. **Real-Time Processing**: **Apache Flink / Spark Streaming** cleans data, deduplicates by device ID, and calculates rolling 5-minute anomaly metrics.
-3. **Hot Path Storage**: Low-latency anomalies written to **Amazon DynamoDB / Timestream** for immediate operational alerting.
-4. **Cold Path Storage**: Raw telemetry batched via **Kinesis Firehose** into S3 Parquet partitions for long-term ML training.
-
+1. **Ingestion**: **AWS IoT Core** receives MQTT messages and an IoT rule forwards them to **Amazon Kinesis Data Streams** (or MSK).
+2. **Real-Time Processing**: **Amazon Managed Service for Apache Flink** or Spark Structured Streaming cleans data, deduplicates by device ID and message ID, and calculates rolling 5-minute anomaly metrics.
+3. **Hot Path Storage**: Anomalies and latest device state go to **DynamoDB**, or to **Timestream for InfluxDB** / OpenSearch for time-series queries and alerting.
+4. **Cold Path Storage**: Raw telemetry flows through **Amazon Data Firehose** to S3 Parquet partitions for long-term analytics and ML training.
 ---
 
 ### Q53. Your Spark job processes skewed keys during joins. What techniques can help?
 **A:**  
-* **Key Salting**: Append random integer suffixes (`0-N`) to the skewed key on the larger table, explode the smaller table $N$ times with matching suffixes, join on salted keys, and aggregate.
+* **Key Salting**: Append random integer suffixes (`0-N`) to the skewed key on the larger table, explode the smaller table N times with matching suffixes, join on salted keys, and aggregate.
 * **Broadcast Join**: If the joining table is small, broadcast it to bypass partition hashing.
 * **AQE Skew Join Optimization**: Enable `spark.sql.adaptive.skewJoin.enabled=true`.
 * **Separate Skewed Keys**: Split the DataFrame into skewed and non-skewed subsets, process separately, and union.
@@ -626,8 +661,15 @@
   window = Window.partitionBy("id").orderBy(col("updated_at").desc())
   deduped = df.withColumn("rank", row_number().over(window)).filter("rank = 1").drop("rank")
   ```
-* **Lakehouse Upsert**: Configure `precombineField="updated_at"` in Apache Hudi / Delta Lake `MERGE INTO`.
-
+* **Lakehouse Upsert (Delta)**: Delta `MERGE` has no precombine option, and it raises an error if several source rows match one target row. So dedupe the source first, then merge and ignore stale updates:
+  ```python
+  (DeltaTable.forPath(spark, path).alias("t")
+     .merge(deduped.alias("s"), "t.id = s.id")
+     .whenMatchedUpdateAll(condition="s.updated_at > t.updated_at")
+     .whenNotMatchedInsertAll()
+     .execute())
+  ```
+* **Hudi**: Set the ordering field (formerly called the precombine field; `hoodie.table.ordering.fields` in Hudi 1.x, `hoodie.datasource.write.precombine.field` in older versions) to `updated_at`, so the record with the latest value wins.
 ---
 
 ### Q55. A data pipeline must be highly available. What design principles would you use?
@@ -641,20 +683,20 @@
 
 ### Q56. A table must be optimized for analytical queries. How would you design the schema?
 **A:**  
-1. **Star Schema Dimensional Modeling**: Normalize into central Fact tables containing numerical metrics and foreign keys, surrounded by denormalized Dimension tables.
-2. **Columnar Format**: Store data in Parquet with Snappy compression.
-3. **Partitioning & Clustering**: Partition by date and Z-order/cluster by high-frequency query filter columns.
-4. **Surrogate Keys**: Use integer surrogate keys for dimensions to optimize join performance.
-
+1. **Star Schema Dimensional Modeling**: A central fact table (numeric measures and foreign keys) surrounded by denormalized dimension tables.
+2. **Columnar Format**: Parquet with Snappy or Zstd compression.
+3. **Partitioning & Clustering**: Partition by date (low cardinality) and sort/Z-order or cluster by high-frequency filter columns.
+4. **Surrogate Keys**: Integer surrogate keys for dimensions to keep joins compact and to support SCD2.
+5. **Grain first**: Define the fact table grain explicitly, and keep measures additive where possible.
 ---
 
 ### Q57. A Spark job runs slowly due to wide transformations. How would you optimize it?
 **A:**  
-1. **Map-Side Aggregations**: Replace `groupByKey` with `reduceByKey` or `aggregateByKey`.
-2. **Broadcast Hash Joins**: Eliminate wide join shuffles for lookup tables under 100MB.
-3. **Filter Early**: Eliminate unneeded rows and columns before entering the wide transformation.
-4. **Tune Shuffle Parallelism**: Align `spark.sql.shuffle.partitions` with cluster CPU cores.
-
+1. **Reduce data before the shuffle**: Filter rows and prune columns first. DataFrame aggregations combine map-side automatically; in RDD code use `reduceByKey`/`aggregateByKey` instead of `groupByKey`.
+2. **Broadcast Hash Joins**: Avoid shuffles for small lookup tables.
+3. **Tune Shuffle Parallelism**: Set `spark.sql.shuffle.partitions` to match data size and cluster cores (2 to 4 tasks per core) or rely on AQE.
+4. **Handle skew**: AQE skew join, salting, or isolating hot keys.
+5. **Avoid repeated wide operations**: Cache or persist a reused intermediate result, and drop redundant `distinct`/`sort` steps.
 ---
 
 ### Q58. You must track slowly changing dimensions. How would you implement SCD Type 1 vs Type 2?
@@ -674,11 +716,11 @@
 
 ### Q60. A pipeline processes 10 million records per minute. What architecture would support it?
 **A:**  
-* **Ingestion**: **Apache Kafka (Amazon MSK)** or **Amazon Kinesis** with pre-provisioned partition/shard capacity.
-* **Processing**: **Apache Flink** or **Spark Structured Streaming** running on Amazon EMR with high memory/compute node clusters.
-* **Storage**: Micro-batches committed into **Apache Iceberg / Delta Lake** on S3 with partitioned Parquet storage.
-* **Caching / Serving**: Real-time aggregations written to **Redis / ClickHouse** for sub-second dashboard access.
-
+* **Sizing first**: 10 million per minute is about 167,000 records per second. On Kinesis (1 MB/s or 1,000 records/s per shard on writes) that needs roughly 170+ shards or on-demand mode; on Kafka, size partitions by throughput and consumer parallelism.
+* **Ingestion**: **Apache Kafka (Amazon MSK)** or **Amazon Kinesis** with provisioned capacity and a well-distributed partition key.
+* **Processing**: **Apache Flink** or **Spark Structured Streaming** on EMR/Managed Flink with checkpointing.
+* **Storage**: Micro-batches committed into **Apache Iceberg / Delta Lake** on S3 as partitioned Parquet, with scheduled compaction to control small files.
+* **Serving**: Real-time aggregates in **Redis / ClickHouse / DynamoDB** for sub-second dashboards.
 ---
 
 ## Questions 61 – 80
@@ -694,29 +736,28 @@
 
 ### Q62. A dataset requires incremental processing only. How would you design it?
 **A:**  
-* **Delta Lake Change Data Feed (CDF) / Auto Loader**:
-  ```python
-  df = spark.readStream.format("cloudFiles") \
-      .option("cloudFiles.format", "parquet") \
-      .load("s3://lake/bronze/")
-  ```
-* **Watermark Filtering**: Filter source datasets where `last_updated_timestamp > last_successful_watermark` and update the control table upon commit.
-
+* **Use the table format's incremental read**:
+  * Delta: `spark.read.format("delta").option("readChangeFeed","true").option("startingVersion", n)` (Change Data Feed must be enabled on the table).
+  * Iceberg: incremental or changelog reads between two snapshot IDs.
+  * Hudi: incremental query (`hoodie.datasource.query.type=incremental` with a begin instant time).
+* **Plain files or databases (high-watermark)**: Filter `last_updated > last_successful_watermark` (use `>=` with a small overlap window and idempotent merge to catch late rows), and update the control table only after the batch commits successfully.
+* **Streaming**: Structured Streaming file source with a checkpoint also gives incremental file processing. (Databricks Auto Loader is the Databricks-specific equivalent.)
 ---
 
 ### Q63. A Spark job must handle late-arriving data. How would you manage it?
 **A:**  
-1. **Event-Time Partition Routing**: Extract source event timestamps and dynamically write records into the corresponding historical partition path (`spark.sql.sources.partitionOverwriteMode=dynamic`).
-2. **Lakehouse MERGE**: Use Delta Lake / Hudi upsert logic to update historical partitions safely without overwriting non-matching historical data.
-
+1. **Event-Time Partitioning**: Use the source event timestamp to decide the target partition, not the arrival time.
+2. **Lakehouse MERGE (preferred)**: Upsert late rows into the Delta/Hudi/Iceberg table by primary key; only the affected files are rewritten and existing rows are preserved.
+3. **If using plain Parquet**: Read the affected partition, union the late rows, deduplicate, and then overwrite that partition. Do **not** write only the late rows with dynamic partition overwrite, because that replaces the whole partition with just those rows.
+4. **Downstream aggregates**: Recompute only the impacted dates/windows, and track an "arrival lag" metric to tune how far back reprocessing must look.
 ---
 
 ### Q64. Your cluster experiences frequent executor failures. How would you debug it?
 **A:**  
-1. **Inspect Failure Codes in YARN / Spark UI**: Look for `Exit code 137` (Container memory limit exceeded) or `Exit code 143` (SIGTERM / Spot preemption).
-2. **Check GC Logs**: Review if long garbage collection pauses caused the driver to mark executors dead (`Heartbeat timed out`).
-3. **Check Local Disk Saturation**: Verify if shuffle spill filled up executor local EBS storage.
-
+1. **Inspect Failure Messages in YARN / Spark UI**: "Container killed by YARN for exceeding memory limits" (exit code often 143), kernel OOM kills (exit 137), or node loss/decommission messages for spot reclaim. Use the diagnostic text, not just the exit code.
+2. **Check GC Logs**: Long pauses can make the driver mark executors dead (`Heartbeat timed out`).
+3. **Check Local Disk**: Verify shuffle spill did not fill executor local storage (EBS/instance store).
+4. **Check data**: Skewed partitions or huge records cause single executors to blow up.
 ---
 
 ### Q65. A pipeline requires high throughput and low latency. What technologies would you use?
@@ -736,13 +777,20 @@
 
 ### Q67. A job must detect anomalies in incoming data. How would you design it?
 **A:**  
-1. **Statistical Anomaly Detection**: In PySpark / Flink, compute rolling mean and standard deviation over a sliding window:
+1. **Statistical Detection**: Compute the rolling mean and standard deviation over the **previous** N points or window (excluding the current record), and flag deviations in both directions:
    ```python
-   # Flag records where value exceeds 3 standard deviations
-   anomaly_df = df.filter(col("value") > (col("mean_val") + 3 * col("stddev_val")))
-   ```
-2. **Routing**: Route identified anomalies to an Amazon SNS alert topic and quarantine S3 bucket.
+   from pyspark.sql import functions as F
+   from pyspark.sql.window import Window
 
+   w = Window.partitionBy("sensor_id").orderBy("event_ts").rowsBetween(-100, -1)
+   scored = (df.withColumn("mean_val", F.avg("value").over(w))
+               .withColumn("std_val",  F.stddev("value").over(w))
+               .withColumn("is_anomaly",
+                           F.abs(F.col("value") - F.col("mean_val")) > 3 * F.col("std_val")))
+   ```
+   For skewed or non-normal data use median absolute deviation (MAD) or IQR instead of mean/std.
+2. **Also monitor pipeline-level anomalies**: row-count drops/spikes, null-rate jumps, and freshness.
+3. **Routing**: Send anomalies to an SNS alert topic and a quarantine bucket for review.
 ---
 
 ### Q68. Your pipeline reads data from multiple APIs. How would you handle ingestion?
@@ -771,48 +819,60 @@
 
 ### Q71. A dataset must support machine learning workloads. How would you design storage?
 **A:**  
-* **Format**: Parquet with Snappy compression for fast batch scans in Python/PyTorch.
-* **Feature Store Integration**: Integrate with **Amazon SageMaker Feature Store** (online low-latency store in DynamoDB, offline historical store in S3).
-* **Versioning**: Use Delta Lake / Iceberg time-travel to reproduce exact ML training datasets for model compliance.
-
+* **Format**: Parquet (Snappy or Zstd) for fast columnar scans from Spark, pandas, and PyTorch data loaders.
+* **Feature Store Integration**: **Amazon SageMaker Feature Store** (managed low-latency online store plus an offline store in S3), or an equivalent such as Feast.
+* **Versioning**: Delta/Iceberg time travel or dataset snapshots to reproduce exact training datasets.
+* **Point-in-time correctness**: Join features using event timestamps to avoid label leakage.
 ---
 
 ### Q72. You need to handle millions of events per second. What architecture would you build?
 **A:**  
-* **Ingestion**: **Apache Kafka (Amazon MSK)** scaled with hundreds of partitions across high-throughput broker nodes.
-* **Compute**: **Apache Flink** on EMR running event-driven stream transformations.
-* **Sink**: Write to **Apache Iceberg** tables on S3 with optimized commit intervals and write real-time metrics to **Amazon Timestream / ClickHouse**.
-
+* **Ingestion**: **Apache Kafka (Amazon MSK)** with many partitions across high-throughput brokers (or Kinesis in on-demand/large provisioned mode), with a well-distributed key.
+* **Compute**: **Apache Flink** (Amazon Managed Service for Apache Flink or on EMR) for stateful, low-latency stream processing.
+* **Sink**: **Apache Iceberg** tables on S3 with tuned commit intervals and scheduled compaction; real-time metrics to ClickHouse, OpenSearch, or Timestream for InfluxDB.
+* **Operations**: Monitor consumer lag, backpressure, checkpoint duration, and hot partitions.
 ---
 
 ### Q73. Your Spark job frequently runs out of memory. What tuning steps would you take?
 **A:**  
-1. Increase `spark.executor.memory` and `spark.executor.memoryOverhead`.
-2. Increase `spark.sql.shuffle.partitions` to reduce data volume per shuffle task.
-3. Tune memory split: increase `spark.memory.fraction` (default 0.6).
-4. Resolve data skew via key salting.
-5. Use Kryo serialization (`spark.serializer=org.apache.spark.serializer.KryoSerializer`).
-
+1. **Find the cause first**: Check for skew (a few huge tasks), huge broadcasts, `collect()` on large data, and oversized partitions.
+2. Increase `spark.sql.shuffle.partitions` (or rely on AQE) to shrink per-task data.
+3. Increase `spark.executor.memory` and `spark.executor.memoryOverhead`. For PySpark and UDF-heavy jobs the Python workers live in the overhead memory, so also consider `spark.executor.pyspark.memory`.
+4. Resolve skew with AQE skew handling or key salting.
+5. Adjust `spark.memory.fraction` / `spark.memory.storageFraction` only if the Spark UI shows storage or execution memory pressure.
+6. Use Kryo serialization for RDD-heavy jobs, and unpersist caches you no longer need.
 ---
 
 ### Q74. A dataset contains nested arrays and structs. How would you flatten them?
 **A:**  
-* **PySpark Recursive / Column Flattening**:
+* **Recursive flattening helper**:
   ```python
-  from pyspark.sql.functions import col, explode
+  from pyspark.sql import functions as F
+  from pyspark.sql.types import StructType, ArrayType
 
-  # Explode array column
-  df_exploded = df.withColumn("phone_record", explode(col("contact_numbers")))
-
-  # Extract nested struct fields
-  df_flat = df_exploded.select(
-      col("user_id"),
-      col("user_name"),
-      col("phone_record.type").alias("phone_type"),
-      col("phone_record.number").alias("phone_number")
-  )
+  def flatten(df):
+      while True:
+          complex_cols = [(f.name, f.dataType) for f in df.schema.fields
+                          if isinstance(f.dataType, (StructType, ArrayType))]
+          if not complex_cols:
+              return df
+          name, dtype = complex_cols[0]
+          if isinstance(dtype, StructType):
+              expanded = [F.col(f"{name}.{c}").alias(f"{name}_{c}") for c in dtype.names]
+              df = df.select("*", *expanded).drop(name)
+          else:
+              df = df.withColumn(name, F.explode_outer(name))
+          # explode_outer keeps rows with null or empty arrays
   ```
-
+* **Targeted version** for a known schema:
+  ```python
+  df_exploded = df.withColumn("phone_record", F.explode_outer("contact_numbers"))
+  df_flat = df_exploded.select(
+      "user_id", "user_name",
+      F.col("phone_record.type").alias("phone_type"),
+      F.col("phone_record.number").alias("phone_number"))
+  ```
+* Exploding multiple arrays multiplies rows (a cartesian product per record), so explode one at a time and aggregate where needed.
 ---
 
 ### Q75. A data lake requires multiple processing layers. How would you design medallion architecture?
@@ -836,33 +896,40 @@
 
 ### Q77. Your ETL pipeline must support backfills. How would you design it?
 **A:**  
-1. **Parameterized Execution Dates**: Design all Spark and Airflow jobs to accept explicit date ranges (`start_date`, `end_date`) instead of using hardcoded `current_date()`.
-2. **Idempotent Writes**: Use dynamic partition overwrite or Lakehouse `MERGE INTO` so backfilled data overwrites target partitions cleanly.
-3. **Airflow Catchup**: Enable Airflow backfilling via CLI:
-   `airflow dags backfill -s 2026-01-01 -e 2026-01-31 pipeline_dag`.
-
+1. **Parameterized Execution Dates**: Jobs accept explicit `start_date`/`end_date` (or the Airflow data interval) instead of using `current_date()`.
+2. **Idempotent Writes**: Lakehouse `MERGE INTO`, or full-partition overwrite, so reruns replace data cleanly.
+3. **Run in chunks** (by day or month), with limits on concurrency (`max_active_runs`, pools) so production is not starved.
+4. **Airflow**: Use the backfill feature (Airflow 2.x CLI: `airflow dags backfill -s 2026-01-01 -e 2026-01-31 pipeline_dag`; Airflow 3 provides backfills in the UI/API and CLI). `catchup=True` is the scheduler-driven alternative.
+5. Validate each chunk (counts/checksums) before moving on.
 ---
 
 ### Q78. A dataset contains inconsistent timestamps. How would you standardize them?
 **A:**  
-* **Standardize to UTC**:
+* **Parse every known format, then standardize to UTC**:
   ```python
-  from pyspark.sql.functions import to_timestamp, to_utc_timestamp, col
+  from pyspark.sql import functions as F
 
-  # Parse multiple date formats and convert to UTC
-  standardized_df = df.withColumn(
-      "clean_timestamp",
-      to_utc_timestamp(to_timestamp(col("raw_date"), "yyyy-MM-dd HH:mm:ss"), "America/New_York")
+  parsed = F.coalesce(
+      F.to_timestamp("raw_date", "yyyy-MM-dd HH:mm:ss"),
+      F.to_timestamp("raw_date", "dd/MM/yyyy HH:mm"),
+      F.to_timestamp("raw_date", "MM-dd-yyyy"),
   )
+  standardized_df = (df.withColumn("local_ts", parsed)
+                       # source timezone comes from data or config, not a hard-coded guess
+                       .withColumn("clean_timestamp_utc",
+                                   F.to_utc_timestamp("local_ts", F.col("source_tz"))))
   ```
-
+* `to_utc_timestamp(ts, tz)` treats `ts` as local time in `tz`, so supply the right source zone (use zone names such as `Asia/Kolkata`, never fixed offsets).
+* Route rows that match no format (`parsed IS NULL`) to a quarantine table.
+* Keep the original raw value for audit.
 ---
 
 ### Q79. A pipeline needs automated schema detection. How would you implement it?
 **A:**  
-* **AWS Glue Crawlers**: Schedule Glue Crawlers to scan S3 prefixes periodically, infer schemas, and register/update partitions in the AWS Glue Data Catalog.
-* **Delta Lake Auto Loader**: Use Spark `cloudFiles` with `cloudFiles.schemaLocation` to automatically infer and track evolving schemas on S3.
-
+* **AWS Glue Crawlers**: Schedule crawlers on S3 prefixes to infer schemas and register/update tables and partitions in the Glue Data Catalog.
+* **Spark inference**: Infer from a sample (`samplingRatio`), then store the schema and enforce it on later reads instead of re-inferring.
+* **Registry and contracts**: Combine with Glue Schema Registry (streaming) and compare detected schema with the registered one; alert or quarantine on breaking changes.
+* **Databricks only**: Auto Loader with `cloudFiles.schemaLocation` infers and tracks evolving schemas.
 ---
 
 ### Q80. A job requires sorting billions of records. What strategies would you use?
@@ -890,16 +957,17 @@
   streaming_df.withWatermark("event_timestamp", "1 hour") \
       .dropDuplicates(["event_id", "event_timestamp"])
   ```
-* **Storage Deduplication**: Merge streaming micro-batches into Delta Lake / Hudi using primary key matching.
-
+  The deduplication key must match your business definition of a duplicate. Including `event_timestamp` is required for the watermark to clean up state, and it works only when duplicates carry the **same** event timestamp. If a retry can change the timestamp, dedupe on `event_id` alone and accept a larger state (or bound it with a TTL).
+* **Storage Deduplication**: Merge micro-batches into Delta/Hudi/Iceberg by primary key in `foreachBatch`, after deduplicating inside the batch.
 ---
 
 ### Q83. A dataset contains extremely large partitions. How would you rebalance them?
 **A:**  
-1. **Repartitioning by Multi-Column Key**: Repartition on a composite key (e.g., `region` + `date`) to break giant single-key partitions into smaller balanced partitions.
-2. **`df.repartition(N)`**: Force a uniform shuffle across $N$ partitions.
-3. **Adaptive Query Execution (AQE)**: Set `spark.sql.adaptive.advisoryPartitionSizeInBytes=134217728` (128MB) to let Spark dynamically rebalance partitions.
-
+1. **`df.repartition(N)`**: Round-robin shuffle into N even partitions (target about 128 MB each).
+2. **Repartition by a higher-cardinality or composite key** (for example `customer_id` plus date) when downstream operations need co-location. If one key value is itself huge, a composite key containing it will not help.
+3. **Salting**: Add a salt to the hot key to spread it across several tasks, then aggregate back.
+4. **AQE**: Enable it so Spark coalesces small and splits skewed shuffle partitions at runtime; `spark.sql.adaptive.advisoryPartitionSizeInBytes` (default 64 MB) sets the target size.
+5. For file output, use `maxRecordsPerFile` or repartition before write to cap file size.
 ---
 
 ### Q84. Your data team needs governance and access control. How would you implement it?
@@ -912,11 +980,11 @@
 
 ### Q85. A pipeline processes financial transactions. How would you ensure data accuracy?
 **A:**  
-1. **Double-Entry Reconciliation**: Verify that debits equal credits at every batch boundary.
-2. **Data Types**: Use exact `DecimalType(18, 2)` instead of floating-point numbers.
-3. **Strict Validation Gatekeeper**: Reject and quarantine any transaction with missing timestamps, invalid accounts, or negative amounts.
-4. **Idempotent Upserts**: Ensure transaction IDs have unique constraints to prevent double-charging.
-
+1. **Reconciliation**: Compare control totals (count and sum per batch and per day) with the source ledger, and verify debits equal credits for double-entry data.
+2. **Data Types**: Use exact `DecimalType` sized for the currency (not float/double). Some FX and crypto data needs more than 2 decimal places.
+3. **Validation Gatekeeper**: Reject and quarantine missing timestamps, invalid accounts, and invalid currencies. Model transaction type and sign explicitly (refunds, reversals, and credits are legitimate negative or opposite-direction entries), and validate against that.
+4. **Idempotency**: Uniqueness constraints are informational only in Redshift/Snowflake and do not exist on S3 tables, so enforce uniqueness in the pipeline: dedupe by transaction ID and use an idempotent `MERGE`.
+5. **Audit trail**: Immutable raw data, lineage, and logs of every correction.
 ---
 
 ### Q86. Your ETL job requires dynamic configuration. How would you design it?
@@ -928,10 +996,13 @@
 
 ### Q87. A dataset must support multi-tenant access. How would you design security?
 **A:**  
-1. **Partition by Tenant ID**: Store data in isolated S3 prefix paths (`s3://lake/tenant_id=XYZ/`).
-2. **Row-Level Security**: Configure Lake Formation Row-Level Filters mapping tenant IAM session tags to matching `tenant_id` rows.
-3. **Dedicated Encryption Keys**: Use tenant-specific AWS KMS keys if contractually required.
-
+1. **Isolation model by scale**:
+   * Few tenants: separate S3 prefixes or tables per tenant, and a Lake Formation data filter (row filter) per tenant granted to that tenant's role.
+   * Many tenants: Redshift row-level security policies keyed on the session user/role, or IAM attribute-based access control (`aws:PrincipalTag`) on S3 access points / bucket policies.
+   * Strict isolation or compliance needs: separate accounts or encryption keys per tenant.
+2. **Partitioning**: Do not partition by `tenant_id` when there are thousands of tenants (small-file explosion); use clustering or bucketing instead.
+3. **Encryption**: Tenant-specific KMS keys when contractually required.
+4. **Audit**: CloudTrail and Lake Formation access logs, plus regular tests that one tenant cannot read another's data.
 ---
 
 ### Q88. A Spark job must join structured and semi-structured data. How would you do it?
@@ -944,10 +1015,9 @@
 
 ### Q89. A data warehouse requires partition pruning. How would you implement it?
 **A:**  
-* Ensure table is partitioned on filter columns (e.g., `date`).
-* Structure queries to filter explicitly on the physical partition key: `WHERE event_date BETWEEN '2026-08-01' AND '2026-08-30'`.
-* Verify in query execution plans (`EXPLAIN`) that non-matching partitions are skipped.
-
+* **External tables (Athena, Redshift Spectrum, Iceberg)**: Partition on the filter column (e.g., `event_date`), filter directly on that raw column (no functions wrapped around it): `WHERE event_date BETWEEN '2026-08-01' AND '2026-08-30'`.
+* **Native Redshift tables** have no partitions; pruning happens through **sort keys** and zone maps, so choose sort keys on the common range-filter columns.
+* **Verify** with `EXPLAIN` (or the scan statistics/bytes scanned) that non-matching partitions or blocks are skipped.
 ---
 
 ### Q90. Your pipeline needs automatic scaling. What technologies would you use?
@@ -960,17 +1030,20 @@
 ### Q91. How would you design a high-performance feature store for ML?
 **A:**  
 * **Dual-Store Architecture**:
-  * **Online Store (Low-Latency)**: Amazon DynamoDB or Redis serving real-time feature lookups ($<10\text{ ms}$) for live inference.
-  * **Offline Store (Scale & Historical)**: Amazon S3 with Delta Lake / Parquet storing point-in-time feature snapshots for ML model training.
-  * **Unified Ingestion**: Feature pipelines write simultaneously to both online and offline stores.
-
+  * **Offline Store (source of truth)**: S3 with Delta/Iceberg/Parquet storing point-in-time feature history for training.
+  * **Online Store (low latency)**: DynamoDB, Redis, or SageMaker Feature Store's online store serving real-time lookups (single-digit to low double-digit milliseconds).
+  * **Materialization**: Feature pipelines compute once, write to the offline store, and materialize the latest values to the online store, which avoids drift between the two.
+* **Point-in-time joins** for training sets to prevent leakage, and the same transformation code for training and serving.
 ---
 
 ### Q92. Your Spark job must process compressed files. What considerations are needed?
 **A:**  
-* **Splittability**: GZIP and standard BZIP2 files are non-splittable by default (a single multi-gigabyte GZIP file is processed by only ONE core).
-* **Best Practice**: Use **Snappy compressed Parquet** or **bzip2 with splittable indexing**, ensuring Spark splits large compressed files across multiple executor tasks in parallel.
-
+* **Splittability**:
+  * GZIP: not splittable (one large file is processed by one task).
+  * BZIP2: splittable, but slow and CPU-heavy.
+  * Raw Snappy, LZ4, and Zstd files: not splittable on their own.
+  * Inside **Parquet/ORC/Avro**, Snappy/Zstd/GZIP compression is applied per block or page, so the file remains splittable.
+* **Best Practice**: Store data as Parquet with Snappy (speed) or Zstd (ratio). If you receive large GZIP files, split them into many moderate files or convert them to Parquet once at ingestion.
 ---
 
 ### Q93. A dataset must support real-time fraud detection. What architecture would you design?
@@ -1001,26 +1074,27 @@
 
 ### Q96. Your pipeline must maintain audit history for compliance. How would you implement it?
 **A:**  
-* **S3 Object Versioning & S3 Object Lock (WORM - Write Once Read Many)**: Guarantees raw data files cannot be overwritten or deleted.
-* **Lakehouse Commit Logs**: Delta Lake / Iceberg commit history preserving exact snapshot histories for regulatory audits.
-* **Pipeline Audit Log Table**: Record every ETL execution batch metadata.
-
+* **S3 Versioning & Object Lock (WORM)**: Object Lock in *compliance* mode cannot be bypassed (governance mode can be bypassed by privileged users), so choose the mode your regulation requires.
+* **Lakehouse Commit History**: Delta/Iceberg/Hudi snapshots give an audit trail, but `VACUUM` and `expire_snapshots` remove old history, so align their retention with the compliance period.
+* **Pipeline Audit Log Table**: Record every batch (source, counts, status, code version).
+* **Access auditing**: CloudTrail data events and Lake Formation logs.
 ---
 
 ### Q97. A streaming pipeline must recover from failures automatically. How would you design it?
 **A:**  
-1. **Persistent Message Retention**: Retain 7 days of raw stream data in Kafka/Kinesis.
-2. **S3 Checkpointing**: Enable Spark Structured Streaming checkpoints.
-3. **Supervisor Auto-Restart**: Run streaming jobs on Kubernetes / EMR with auto-restart policies on pod failure.
-4. **Idempotent Destination Writes**: Ensure replaying uncommitted micro-batches overwrites partial writes cleanly.
-
+1. **Retention longer than your worst-case outage**: Kafka defaults to 7 days; Kinesis defaults to 24 hours (extendable up to 365 days).
+2. **Checkpointing**: Spark Structured Streaming / Flink checkpoints on durable storage (S3).
+3. **Auto-restart**: Run on Kubernetes, EMR, or Managed Flink with restart policies and alarms on repeated failures.
+4. **Idempotent Destination Writes**: Replaying an uncommitted micro-batch must not duplicate data (atomic table-format commits or deterministic MERGE).
+5. **Lag alarms**: Alert on consumer lag/iterator age so slow recovery is noticed.
 ---
 
 ### Q98. Your Spark job must read from multiple partitions simultaneously. How would you optimize it?
 **A:**  
-* Optimize partition discovery: enable `spark.sql.sources.parallelPartitionDiscovery.enabled=true` and `spark.sql.sources.parallelPartitionDiscovery.threshold=32`.
-* Increase parallel S3 listing threads to speed up multi-partition directory scans.
-
+* **Speed up partition discovery**: Keep `spark.sql.sources.parallelPartitionDiscovery.threshold` at a suitable value (default 32) so large listings run in parallel.
+* **Avoid S3 listing altogether**: Use Glue Catalog partition indexes or Athena partition projection, and table formats (Iceberg/Delta/Hudi) that read file lists from metadata instead of S3 `LIST` calls.
+* **Prune**: Filter on partition columns so only needed partitions are listed and read.
+* **Keep the partition count manageable** (see the partitioning strategy in Q20).
 ---
 
 ### Q99. A pipeline must process historical and real-time data together. How would you design it?
@@ -1033,13 +1107,364 @@
 
 ### Q100. Explain an end-to-end data engineering project you built and the challenges you solved.
 **A:**  
-"I designed and built an enterprise-scale Change Data Capture (CDC) Lakehouse platform on AWS:
-* **Architecture**: AWS DMS captures transactional database mutations from PostgreSQL and stages them in Amazon S3. AWS Glue (PySpark) jobs process CDC feeds (`INSERT`, `UPDATE`, `DELETE`) and execute SCD Type-1 upserts and hard deletes into Apache Hudi / Delta Lake on S3. Amazon Redshift Spectrum and Athena query curated data directly for business intelligence dashboards. Orchestrated end-to-end using Apache Airflow (MWAA).
-* **Key Challenges Solved**:
-  1. *Small File Problem*: Resolved by implementing automated Lakehouse compaction jobs and tuning Spark partition write sizes (128MB–256MB).
-  2. *Data Skew*: Resolved join bottlenecks on high-volume keys using key salting and Spark Adaptive Query Execution (AQE).
-  3. *Zero Duplicate Ingestion*: Enforced strict pipeline idempotency using Lakehouse primary-key upserts with event-time precombining.
-  4. *Cost Optimization*: Storing historical data in S3 queried via Redshift Spectrum cut data warehouse cluster storage costs by 40%."
+Use a real project of your own. Structure it as **context, architecture, challenges, result**, and only quote numbers you can defend. Example structure (replace the bracketed parts with your own facts):
+
+"I built a CDC-based Lakehouse pipeline on AWS for [business area].
+* **Architecture**: AWS DMS captures changes from [source database] into S3. AWS Glue (PySpark) jobs apply `INSERT`/`UPDATE`/`DELETE` records as SCD Type 1 upserts and deletes into Apache Hudi tables on S3, orchestrated by Apache Airflow. Curated data is queried through Athena and Redshift Spectrum.
+* **Challenges and solutions**:
+  1. *Small files*: [what I observed], solved with [compaction/clustering and write-size tuning].
+  2. *Data skew*: [which keys], solved with [salting/AQE].
+  3. *Duplicates and ordering*: solved with idempotent upserts using an ordering field on the change timestamp.
+  4. *Cost/performance*: [what I changed] which gave [measured improvement and how I measured it].
+* **Result**: [data volume, latency/SLA, reliability, and business impact]."
+
+Be ready for follow-ups: how do you handle late or out-of-order CDC events, schema changes, reprocessing, and monitoring?
 
 ---
-*End of 100 Scenario-Based Data Engineer Interview Questions & Answers.*
+
+## Questions 101 – 137
+
+### Q101. Your Glue job reprocesses the same files every run. Why, and how do you fix it?
+**Answer:**
+- **Cause:** job bookmarks are off, or they are on but not wired correctly. Bookmarks need a `transformation_ctx` on each source, `job.init(args["JOB_NAME"], args)` at the start and `job.commit()` at the end. They do **not** apply when you read with plain `spark.read` (only DynamicFrame reads).
+- For S3, bookmarks track files by last-modified time. Files overwritten in place get a new timestamp and are re-read.
+- JDBC sources need bookmark keys that are sorted and monotonically increasing.
+- **Fixes:** enable `--job-bookmark-option job-bookmark-enable`, add `transformation_ctx`, write new files with new names, and make the load **idempotent anyway** (MERGE/partition overwrite) so a bookmark reset or retry is harmless. Reset deliberately with `aws glue reset-job-bookmark --job-name <job>` for a backfill.
+
+### Q102. DMS delivers CDC files to S3. How do you apply them correctly (ordering, duplicates, deletes)?
+**Answer:**
+1. Configure the DMS S3 target to include the operation column (`Op`: I/U/D) and a **timestamp column** (`TimestampColumnName`). Set `IncludeOpForFullLoad` so full-load rows are marked as inserts.
+2. Full load files land first, then CDC files. Process both with the same logic.
+3. **Deduplicate per key:** keep the latest change per primary key within the batch (`row_number` over key, order by change timestamp desc, then a tiebreaker such as file order or transaction ID).
+4. **Apply with MERGE:** `WHEN MATCHED AND Op='D' THEN DELETE` (or soft delete), `WHEN MATCHED THEN UPDATE`, `WHEN NOT MATCHED AND Op != 'D' THEN INSERT`.
+5. DMS can emit duplicates after a task restart, so the merge must be idempotent. Reject stale events by comparing the change timestamp with the target's last-applied timestamp.
+6. Watch for large objects (LOB settings), DDL changes, and keep the DMS task's latency metrics under alarm.
+
+### Q103. Hudi Copy-on-Write or Merge-on-Read? How do you choose?
+**Answer:**
+| | COW | MOR |
+|---|---|---|
+| Write | Rewrites base Parquet files on update (higher write cost) | Appends updates to log files (fast writes) |
+| Read | Fast, plain Parquet | Snapshot queries merge logs on read (slower), read-optimized queries skip logs (stale) |
+| Maintenance | None for merging | Needs compaction |
+| Fits | Read-heavy, batch updates, simple consumers | Frequent small updates, near-real-time ingestion |
+
+Check engine support before choosing. Athena supports both; Redshift Spectrum support has historically centered on COW, so verify the current matrix for MOR. For SCD1 on a nightly CDC load with Spectrum consumers, COW is the simple, safe choice.
+
+### Q104. Redshift Spectrum queries on S3 are slow. What do you check?
+**Answer:**
+- **Scanned bytes vs returned bytes** (`SVL_S3QUERY_SUMMARY`): high scan means partition pruning or columnar pruning is not working.
+- Is the table **partitioned** on the filtered column, and does the query filter on the raw partition column (no functions wrapped around it)?
+- File format and size: Parquet/ORC, files at least ~128 MB, not thousands of KB files. Compact if needed.
+- Catalog partition count: too many partitions slows planning. Use partition indexes or projection where available.
+- Statistics: set table row-count properties for external tables so the planner joins sensibly.
+- Join large external tables to small local dimension tables, not external-to-external.
+- Keep hot, frequently joined data in local Redshift tables. Use Spectrum for cold or large history.
+
+### Q105. Redshift queries got slow after a big load. What do you check?
+**Answer:**
+1. `SVV_TABLE_INFO`: `stats_off` (stale statistics), `unsorted` (percent unsorted region), `skew_rows` (distribution skew), `tbl_rows`.
+2. Run `ANALYZE` and `VACUUM` (sort) where auto maintenance has not caught up.
+3. Check **queueing**: WLM/concurrency-scaling metrics, long queries blocking short ones.
+4. Look at the plan (`EXPLAIN`) for broadcast/redistribution steps (`DS_BCAST_INNER`, `DS_DIST_BOTH`). Fix with a better `DISTKEY`/`DISTSTYLE`.
+5. Check for disk-based (spilled) steps and for a skewed `DISTKEY`.
+6. Compare with the last good run of the query (query history) to see what changed.
+
+### Q106. A Redshift `COPY` from S3 fails or loads partial data. How do you troubleshoot?
+**Answer:**
+- Read the error tables: `SYS_LOAD_ERROR_DETAIL` (or `STL_LOAD_ERRORS` on provisioned clusters) show file, line, column, and reason.
+- Common causes: delimiter/quote issues, type mismatch, column count mismatch, string longer than the column, bad date format, IAM role missing S3/KMS permissions.
+- Use `MAXERROR` carefully, and prefer loading to a staging table to validate before merging.
+- For speed: split input into multiple files (a multiple of the number of slices), compress, use a manifest to control exactly which files load.
+- Make the load idempotent: load into staging, then delete+insert or MERGE, inside one transaction.
+
+### Q107. Upstream renames a column or changes a column type without telling you. How do you handle it?
+**Answer:**
+- **Detect:** schema validation at ingestion, schema registry compatibility checks, or a data contract (Q117). Fail or quarantine the batch instead of silently writing nulls.
+- **Rename:** Parquet reads columns by name, so a rename looks like a dropped column plus a new one. Iceberg tracks columns by ID, so renames are metadata-only. Delta needs column mapping enabled. Hudi has limited rename support.
+- **Type change:** widening (int to long, float to double) is usually safe. Narrowing or int to string is breaking.
+- **Safe migration:** add a new column, populate both for a period, backfill history, switch consumers, then drop the old column.
+- Keep raw bronze untouched so you can replay after fixing the mapping.
+
+### Q108. The source sends a full snapshot every day. How do you detect inserts, updates, and deletes?
+**Answer:**
+```python
+curr = spark.table("silver.customers").filter("is_deleted = false")
+inserts = snapshot.join(curr, "id", "left_anti")
+deletes = curr.join(snapshot, "id", "left_anti")
+# updates: same id, different row hash
+h = lambda d: d.withColumn("row_hash", F.sha2(F.concat_ws("||", *cols), 256))
+updates = h(snapshot).alias("s").join(h(curr).alias("c"), "id") \
+            .filter("s.row_hash <> c.row_hash")
+```
+Apply with MERGE. Mark deletes as soft deletes. **Safeguard:** if the snapshot's row count drops by more than a set threshold (or is empty), stop and alert. A partial or failed extract would otherwise delete everything.
+
+### Q109. You must backfill one year of history without hurting production. How?
+**Answer:**
+- Run in **chunks** (by month or day partition), not one huge job. Parameterize start/end dates.
+- Use **idempotent writes** (partition overwrite with full partition contents, or MERGE) so a failed chunk can be rerun.
+- Isolate resources: separate Airflow pool and `max_active_runs`, a separate Glue job/cluster, and throttle reads on the source database or API.
+- Write to a **shadow table/location**, validate counts and checksums per chunk, then swap or merge into the live table.
+- Pause or coordinate with the daily incremental job so they do not write the same partitions concurrently.
+- Estimate cost and runtime from one sample chunk first.
+
+### Q110. Your Glue bill doubled. How do you cut cost without hurting SLAs?
+**Answer:**
+1. Find the expensive jobs (DPU-hours per job in Cost Explorer/CloudWatch).
+2. Right-size: worker type and count. Enable **Auto Scaling**. Do not over-provision a job that idles.
+3. Use the **Flex execution class** for non-urgent jobs.
+4. Process incrementally (bookmarks/watermarks) instead of full refresh.
+5. Fix small files and skew, which burn DPU hours. Use Parquet, partition pruning, and predicate pushdown.
+6. Use a recent Glue version (performance improvements) and avoid unnecessary `count()`/`collect()` actions.
+7. Move trivial transforms to Athena/Redshift SQL or a Python shell/Lambda job.
+8. Add cost alarms and per-job budgets via tags.
+
+### Q111. How do you prove the target matches the source after a migration or pipeline run?
+**Answer:**
+- **Layered reconciliation:** (1) row counts per partition/day, (2) sum/min/max of numeric and date columns, (3) null counts of key columns, (4) distinct key counts, (5) row-level hash comparison for a sample or the full set (hash of concatenated columns, compared with an anti-join or aggregated per bucket).
+- Compare like with like: freeze the source with a snapshot or a cutoff timestamp, and allow a tolerance window for in-flight CDC.
+- Automate it as a task after every load, and write results (source count, target count, difference, status) to an audit table with alerts on mismatch.
+- Investigate differences by narrowing: partition, then key range, then row.
+
+### Q112. The pipeline is green, but the business says the dashboard numbers are wrong. What do you do?
+**Answer:**
+1. **Clarify:** which metric, which dates, what is expected, since when. Get a concrete failing example.
+2. **Trace backward** with lineage: dashboard query, gold table, silver, bronze, source. Compare counts and values at each hop to find where it diverges.
+3. **Common causes:** join fan-out (duplicates), late data not included, timezone/date boundary, a filter or dedupe rule change, a stale or partial upstream load, schema change producing nulls, a double-counted backfill.
+4. Use **time travel** (Delta/Iceberg) to compare today's table with yesterday's.
+5. **Fix and repair:** correct the logic, backfill affected partitions idempotently, and tell stakeholders what was wrong and the corrected date range.
+6. **Prevent:** add the missing test (reconciliation, uniqueness, freshness, volume anomaly) so the same failure turns the pipeline red next time.
+
+### Q113. A Lambda function must process 5 GB files, but Lambda has limits. What are your options?
+**Answer:**
+- Lambda limits: 15-minute timeout, up to 10 GB memory, and limited ephemeral `/tmp` storage. So do not load whole files.
+- **Stream** the object in ranges/chunks (S3 range GETs), process incrementally, write outputs in parts.
+- **Fan out:** an orchestrator splits the file by byte ranges or lines, and Step Functions Distributed Map runs many Lambdas in parallel.
+- For heavy transforms, hand off to **Glue, EMR Serverless, or ECS/Fargate** and use Lambda only for triggering.
+- Always make the function idempotent, since S3 events can be delivered more than once.
+
+### Q114. Two jobs write to the same lakehouse table at the same time. What happens and how do you design for it?
+**Answer:**
+- Table formats use **optimistic concurrency**: a writer commits only if no conflicting commit happened since it started; otherwise it fails or retries. Writes to different partitions or files usually do not conflict. Overlapping updates to the same files do.
+- **Hudi:** enable OCC with a lock provider (DynamoDB, Hive Metastore, or ZooKeeper).
+- **Delta on S3:** multi-cluster writes historically needed a DynamoDB-backed log store. Newer versions can use S3 conditional writes, so verify your version.
+- **Iceberg:** the catalog performs an atomic commit (Glue Catalog supports this), with retries on conflict.
+- **Design choices:** separate writers by partition, serialize conflicting jobs in Airflow (pools, `max_active_runs=1`), retry on commit conflict, and keep transactions small.
+
+### Q115. A user asks you to delete their data (GDPR "right to erasure"). How do you do it in a data lake?
+**Answer:**
+1. Locate all copies: bronze, silver, gold, derived tables, extracts, caches, and backups (lineage helps).
+2. Delete rows with a table-format `DELETE`/MERGE (Delta, Iceberg, Hudi), keyed by a user identifier.
+3. Deletes are logical until old files are removed: run `VACUUM` (Delta), `expire_snapshots` + `remove_orphan_files` (Iceberg), or cleaning/compaction (Hudi). Time travel will otherwise still expose the data.
+4. Raw immutable layers: rewrite the affected files, or use **crypto-shredding** (encrypt per-user data with a per-user key and delete the key).
+5. Run deletions in batches, log the request and completion for audit, and define a deadline-based SLA.
+
+### Q116. Another AWS account needs read access to your curated tables. How do you share securely?
+**Answer:**
+- **Lake Formation cross-account sharing:** grant table or column permissions to the other account (via AWS RAM). The consumer creates a resource link in its own catalog and queries via Athena/Redshift/EMR with its own IAM roles.
+- Alternative: S3 bucket policy plus Glue catalog resource policy (more manual and harder to audit).
+- For warehouse data: Redshift **data sharing** avoids copying.
+- Encrypt with KMS and grant the consumer account key access. Share only the curated layer, with column-level restriction for PII, and log access via CloudTrail.
+
+### Q117. Upstream teams keep breaking your pipelines with unannounced changes. What do you propose?
+**Answer:** **Data contracts.**
+- A versioned agreement between producer and consumer covering schema (types, nullability), semantics (units, allowed values), freshness/volume SLAs, ownership, and the change process.
+- Enforce in CI: producers' schema changes are checked against registered contracts (schema registry compatibility). Breaking changes require a new version and a deprecation window.
+- Enforce at runtime: ingestion validates against the contract, quarantines violations, and alerts the owning team.
+- Give every dataset an owner and an on-call route.
+
+### Q118. You must load 200 tables with the same logic in Airflow. How do you build the DAG?
+**Answer:**
+- Do not copy-paste tasks. Use a **metadata/config table or YAML** and **dynamic task mapping** (`.expand()`, Airflow 2.3+) or a DAG factory.
+- Keep each task **idempotent** and parameterized by table and date.
+- Control load with pools and `max_active_tasks`. Group tables by priority or domain (TaskGroups).
+- Avoid heavy code at DAG top level (parse time!). Do not call databases or APIs when the file is parsed. Read config cheaply or in a task.
+- Pass small values via XCom. Put large data in S3 and pass the path.
+- Use deferrable sensors/operators for long waits.
+
+### Q119. Airflow tasks stay in "queued" for a long time. What do you check?
+**Answer:**
+1. **Capacity limits:** `parallelism`, `max_active_tasks_per_dag`, `max_active_runs`, pool slots exhausted (including slots held by sensors in `poke` mode).
+2. **Workers:** Celery/Kubernetes workers down, at `worker_concurrency`, or autoscaling lagging. On MWAA, check environment class and min/max workers.
+3. **Scheduler health:** heartbeat, parse time (slow DAG files), too many DAGs.
+4. Queue mismatch: task assigned to a queue no worker listens to.
+5. Fixes: sensors in `reschedule` mode or deferrable, right-size pools, scale workers, simplify top-level DAG code.
+
+### Q120. A join returns far fewer rows than expected. What do you check?
+**Answer:**
+- **Key mismatch:** type difference (string vs int, implicit casts), leading/trailing spaces, case, zero-padding, hidden characters. Fix with explicit casts, `trim`, `lower`.
+- **Nulls:** `NULL = NULL` is not true. Use null-safe equality (`<=>` / `eqNullSafe`) if appropriate.
+- **Join type:** inner instead of left.
+- **Filters in the wrong place:** a `WHERE` on the right table of a left join turns it into an inner join. Put it in the `ON` clause.
+- Diagnose with a `left_anti` join to list unmatched keys, and compare distinct key counts on both sides.
+
+### Q121. The same Spark job gives different results on different runs. Why?
+**Answer:** Non-determinism sources:
+- `row_number()`/`dropDuplicates`/`first()` on ties without a tiebreaker column.
+- `rand()` without a seed, `monotonically_increasing_id()` assumptions, `collect_list` order.
+- Reading a folder that is changing while the job runs (new files arriving).
+- Non-deterministic UDFs, floating-point summation order, time-dependent functions (`current_timestamp`).
+- **Fix:** add deterministic ordering and tiebreakers, set seeds, read a fixed snapshot (table version or explicit file list), and use `Decimal` for money.
+
+### Q122. A Python UDF makes the job 10x slower. What do you do?
+**Answer:**
+- Python UDFs move data JVM to Python row by row (serialization overhead) and block Catalyst optimizations.
+- **Preference order:** built-in Spark SQL functions, then SQL expressions (`F.expr`, `when/otherwise`), then **pandas UDFs** (Arrow-based, vectorized), then a Scala/Java UDF, and a plain Python UDF last.
+- Filter and prune columns before the UDF, and avoid calling it on skewed or duplicate values (compute on distinct values and join back).
+
+### Q123. A broadcast join fails with a timeout or driver OOM. What now?
+**Answer:**
+- A broadcast table is collected to the driver and shipped to executors. If it is bigger than expected after decompression, it can exhaust memory or exceed `spark.sql.broadcastTimeout`.
+- Check the real in-memory size (Parquet compresses heavily), filter/select the small table first, raise driver memory and the timeout only if justified, or disable broadcast for that join (`spark.sql.autoBroadcastJoinThreshold=-1` or a `MERGE`/`SHUFFLE_HASH` hint).
+- Prefer letting AQE choose based on runtime statistics.
+
+### Q124. A pandas script in a Glue Python shell job runs out of memory. What are your options?
+**Answer:**
+- Process in **chunks** (`chunksize`), select only needed columns (`usecols`), set compact dtypes (`category`, `int32`), and write Parquet in parts.
+- Switch to a lazy or out-of-core engine: **Polars** (lazy), **DuckDB**, or **Dask**.
+- If data is truly large or growing, move to Glue Spark / EMR Serverless.
+- Avoid copies (`inplace`-style chains create copies), delete intermediates, and read Parquet instead of CSV.
+
+### Q125. SQL: assign session IDs to clickstream events using a 30-minute inactivity gap.
+**Answer:**
+```sql
+WITH ordered AS (
+  SELECT user_id, event_ts,
+         LAG(event_ts) OVER (PARTITION BY user_id ORDER BY event_ts) AS prev_ts
+  FROM events
+),
+flagged AS (
+  SELECT user_id, event_ts,
+         CASE WHEN prev_ts IS NULL
+                OR DATEDIFF(minute, prev_ts, event_ts) > 30
+              THEN 1 ELSE 0 END AS new_session
+  FROM ordered
+)
+SELECT user_id, event_ts,
+       SUM(new_session) OVER (PARTITION BY user_id ORDER BY event_ts
+                              ROWS UNBOUNDED PRECEDING) AS session_id
+FROM flagged;
+```
+`DATEDIFF(minute, ...)` is Redshift/Snowflake syntax; in Spark use `(unix_timestamp(event_ts) - unix_timestamp(prev_ts)) / 60`.
+
+### Q126. SQL: find users with 3 or more consecutive login days (gaps and islands).
+**Answer:**
+```sql
+WITH d AS (
+  SELECT DISTINCT user_id, CAST(login_ts AS DATE) AS login_date FROM logins
+),
+g AS (
+  SELECT user_id, login_date,
+         login_date - CAST(ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY login_date) AS INT) AS grp
+  FROM d
+)
+SELECT user_id, MIN(login_date) AS streak_start, MAX(login_date) AS streak_end, COUNT(*) AS days
+FROM g
+GROUP BY user_id, grp
+HAVING COUNT(*) >= 3;
+```
+Idea: within a consecutive run, `date - row_number` is constant. Adjust the date arithmetic to your engine (`DATEADD`, `date_sub`).
+
+### Q127. A fact row arrives before its dimension row (late-arriving dimension). How do you handle it, and which SCD2 version does a late fact join to?
+**Answer:**
+- **Late dimension:** insert an **inferred member** (placeholder row with a surrogate key, natural key, and `is_inferred = true`). Load the fact against it, then update that dimension row (Type 1 on the inferred flag) when the real record arrives, so facts do not need reloading.
+- **Which SCD2 version:** join on the natural key and the event date falling within the version's range, `fact.event_date >= dim.start_date AND fact.event_date < dim.end_date`. This gives point-in-time-correct results, including for late facts.
+- If a late dimension change backdates history, you may need to restate dimension version ranges and affected facts.
+
+### Q128. Kinesis shows `ProvisionedThroughputExceeded` and iterator age keeps growing. What do you do?
+**Answer:**
+- **Write side:** a **hot shard** from a skewed partition key. Fix the key (add a random suffix or use a higher-cardinality key). Respect limits per shard (1 MB/s or 1,000 records/s writes). Add shards, use on-demand mode, batch with `PutRecords`, and retry with backoff.
+- **Read side:** consumers share 2 MB/s per shard. Use **enhanced fan-out** for dedicated throughput per consumer, scale consumers to shard count, and speed up the processing logic.
+- Monitor `GetRecords.IteratorAgeMilliseconds` (consumer lag) and alarm on it.
+
+### Q129. Your Spark Structured Streaming job lags behind the Kafka topic. How do you fix it?
+**Answer:**
+- Measure: per-batch input rate vs processing rate, batch duration, and offsets behind latest.
+- Increase parallelism: topic partitions and Spark cores must match. Tune `maxOffsetsPerTrigger` so batches are neither tiny nor enormous.
+- Reduce per-batch work: avoid skewed keys, expensive UDFs, and tiny-file sinks. Tune shuffle partitions for streaming (state-store partitions are fixed once the checkpoint exists).
+- Scale executors. Increase the trigger interval if latency permits (fewer, bigger batches).
+- Check the sink (S3 commit time, database upserts) since it is often the bottleneck.
+
+### Q130. Streaming state keeps growing until the job runs out of memory. Why?
+**Answer:**
+- Stateful operations (aggregations, dedup, stream-stream joins) keep state until a **watermark** allows cleanup. With no watermark, state is kept forever.
+- Add `withWatermark` on the event-time column, bound join conditions with a time range, include the watermark column in dedup keys.
+- Use the **RocksDB state store** for large state (Spark 3.2+), and monitor state size per batch.
+- Consider changing the design: shorter windows, pre-aggregate upstream, or move state to an external store.
+
+### Q131. Streaming into Iceberg/Delta creates thousands of tiny files. What do you do?
+**Answer:**
+- Trade-off: shorter commit/trigger intervals mean lower latency but more small files. Raise the trigger interval to what the business really needs.
+- Schedule **compaction**: Iceberg `rewrite_data_files` (or Athena `OPTIMIZE ... REWRITE DATA USING BIN_PACK`, or Glue Data Catalog's automatic compaction optimizer), Delta `OPTIMIZE`, Hudi clustering/compaction.
+- Also expire old snapshots and remove orphan files, otherwise metadata and storage grow.
+- Partition coarsely (daily/hourly), not by high-cardinality keys.
+
+### Q132. Design disaster recovery for your data platform. What do you decide first?
+**Answer:**
+- First define **RPO** (acceptable data loss) and **RTO** (acceptable downtime) per tier. Not everything needs the same level.
+- **S3:** versioning plus cross-region replication for critical buckets. Object Lock for immutable raw data.
+- **Warehouse:** Redshift automated and cross-region snapshots.
+- **Catalog and metadata:** export Glue Data Catalog definitions, store DAGs, Glue scripts, and configs in Git.
+- **Infrastructure as code** (Terraform) so the stack can be recreated in another region.
+- **Streams:** replay from retained logs. Document and **rehearse** the runbook, since an untested DR plan is a guess.
+
+### Q133. How would you build CI/CD for data pipelines with GitHub Actions and Terraform?
+**Answer:**
+- **On pull request:** lint (ruff/flake8, black), unit tests (`pytest` with a small local SparkSession and fixtures), Airflow DAG integrity test (load `DagBag`, assert no import errors), `terraform fmt`, `validate`, and `plan` (posted to the PR).
+- **On merge to main:** `terraform apply` (reviewed or approved), upload Glue scripts and packaged dependencies to S3, sync DAGs to the MWAA bucket.
+- **Environments:** dev, then staging, then prod, with the same code and different variables. Smoke test after deployment.
+- **Security:** authenticate to AWS using GitHub **OIDC** and an IAM role (no long-lived keys). Keep secrets in Secrets Manager.
+- **State:** remote Terraform state in S3 with locking (a DynamoDB table or the newer native S3 lockfile).
+- Version everything and support rollback by redeploying a previous tag.
+
+### Q134. Glue, EMR, EMR Serverless, or Redshift SQL for a transformation? How do you choose?
+**Answer:**
+| Option | Choose when |
+|---|---|
+| **Glue (Spark)** | Serverless, event/schedule-driven jobs, quick to operate, moderate size, native catalog integration |
+| **EMR on EC2/EKS** | Fine control over cluster and Spark/Hive/Presto versions, long-running or very large workloads, custom libraries, cost tuning with spot |
+| **EMR Serverless** | Spark without managing clusters, bursty workloads, more tuning freedom than Glue |
+| **Redshift SQL (ELT)** | Data already in the warehouse, SQL-friendly transformations, strong set-based joins and aggregations |
+| **Athena/dbt** | Lightweight SQL transformations on S3 |
+
+Decide by data volume, team skills, latency, cost model, and operational burden, not by habit.
+
+### Q135. At 3 AM, the pipeline missed its SLA. Walk through your response.
+**Answer:**
+1. **Acknowledge and triage:** what failed, since when, which downstream datasets and consumers are affected (blast radius).
+2. **Stop the damage:** pause downstream jobs that would publish wrong data, and notify stakeholders with an ETA.
+3. **Diagnose:** logs, Spark UI/CloudWatch, recent deployments or schema changes, upstream arrival time, resource limits.
+4. **Fix or work around:** rerun (the pipeline should be idempotent), scale resources, or temporarily skip a non-critical stage.
+5. **Verify:** reconciliation and quality checks before reopening downstream jobs.
+6. **Communicate** the resolution, and afterward write a blameless **post-mortem** with root cause, impact, and preventive actions (alerts, tests, runbook updates).
+
+### Q136. How do you handle timezones and daylight saving time in pipelines?
+**Answer:**
+- Store and process timestamps in **UTC**. Keep the original timezone/offset as a separate column if it matters for the business.
+- Convert to local time only at the presentation layer, using proper zone names (`America/New_York`), never fixed offsets.
+- DST creates **ambiguous** (clocks repeat) and **non-existent** (clocks skip) local times, so avoid parsing naive local timestamps when possible, or define a rule.
+- Define "business day" boundaries explicitly (in which timezone), since date partitions and daily aggregates depend on it.
+- Test around DST transition dates.
+
+### Q137. How do you monitor data freshness and detect missing or abnormal data automatically?
+**Answer:**
+- **Freshness:** expected arrival time per dataset vs latest partition/max event timestamp. Alert on breach.
+- **Volume:** compare row counts with the same weekday in previous weeks (z-score or percent bands), and alert on both drops and spikes.
+- **Completeness and validity:** null rates, uniqueness of keys, accepted-values checks, referential integrity (Great Expectations, Glue Data Quality, dbt tests).
+- **Distribution drift:** key metric ranges and category proportions.
+- Record all results in a metrics table, show them on a dashboard, and route alerts by dataset owner with severity levels. Avoid alert noise by tuning thresholds.
+
+---
+
+## How to Structure Scenario Answers
+
+Use this structure in interviews so answers sound designed, not memorized:
+
+1. **Clarify** (30 seconds): data volume, latency need, source and sink, failure tolerance, team and cost constraints.
+2. **State the design** in one or two sentences, then go through ingestion, processing, storage, serving, orchestration.
+3. **Name the trade-offs:** why this option and not the obvious alternative (for example MOR vs COW, Glue vs EMR).
+4. **Cover failure modes:** retries, idempotency, late and duplicate data, schema change, backfills.
+5. **Cover operations:** monitoring, alerting, data quality, cost, security.
+6. **Tie it to your experience:** one sentence about a similar problem you solved, with real numbers you can defend.
+
+**Phrases that signal seniority:** "I'd make it idempotent first", "what's the SLA and the cost of being wrong?", "I'd verify with reconciliation", "that depends on the table format and engine version".
