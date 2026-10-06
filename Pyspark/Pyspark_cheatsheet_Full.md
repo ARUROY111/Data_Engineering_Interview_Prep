@@ -5,22 +5,24 @@
 > Section **24** has real-world practice scenarios with sample data and collapsible solutions.
 > Targets Spark 3.x. Items needing a newer version are noted inline.
 
+<a id="contents"></a>
+
 **Contents**
 
 | # | Section | # | Section |
 |---|---|---|---|
-| 1 | Basic Operations | 13 | Null Handling & Data Quality |
-| 2 | Selecting and Filtering Data | 14 | Spark SQL |
-| 3 | Joining DataFrames | 15 | UDFs |
-| 4 | Aggregations | 16 | Partitioning & Performance Tuning |
-| 5 | Window Functions | 17 | Table Formats & Upserts (Delta / Hudi / Iceberg) |
-| 6 | Conditional Statements | 18 | CDC & SCD Patterns |
-| 7 | String Functions | 19 | Structured Streaming |
-| 8 | Number Functions | 20 | JDBC, Redshift & S3 |
-| 9 | Date & Time Functions | 21 | AWS Glue Specifics |
-| 10 | Column Operations | 22 | Testing & Production Patterns |
-| 11 | Write Data | 23 | Ending Spark |
-| 12 | Schemas & Complex Types | 24 | Real-World Practice Scenarios |
+| 1 | [Basic Operations](#1-basic-operations) | 13 | [Null Handling & Data Quality](#13-null-handling--data-quality) |
+| 2 | [Selecting and Filtering Data](#2-selecting-and-filtering-data) | 14 | [Spark SQL](#14-spark-sql) |
+| 3 | [Joining DataFrames](#3-joining-dataframes) | 15 | [UDFs](#15-udfs) |
+| 4 | [Aggregations](#4-aggregations) | 16 | [Partitioning & Performance Tuning](#16-partitioning--performance-tuning) |
+| 5 | [Window Functions](#5-window-functions) | 17 | [Table Formats & Upserts (Delta / Hudi / Iceberg)](#17-table-formats--upserts-delta--hudi--iceberg) |
+| 6 | [Conditional Statements](#6-conditional-statements) | 18 | [CDC & SCD Patterns](#18-cdc--scd-patterns) |
+| 7 | [String Functions](#7-string-functions) | 19 | [Structured Streaming](#19-structured-streaming) |
+| 8 | [Number Functions](#8-number-functions) | 20 | [JDBC, Redshift & S3](#20-jdbc-redshift--s3) |
+| 9 | [Date & Time Functions](#9-date--time-functions) | 21 | [AWS Glue Specifics](#21-aws-glue-specifics) |
+| 10 | [Column Operations](#10-column-operations) | 22 | [Testing & Production Patterns](#22-testing--production-patterns) |
+| 11 | [Write Data](#11-write-data) | 23 | [Ending Spark](#23-ending-spark) |
+| 12 | [Schemas & Complex Types](#12-schemas--complex-types) | 24 | [Real-World Practice Scenarios](#24-real-world-practice-scenarios) |
 
 ---
 
@@ -85,6 +87,8 @@ df.explain(True)              # Parsed, analyzed, optimized, physical plans
 df.rdd.getNumPartitions()
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 2. Selecting and Filtering Data
@@ -142,6 +146,8 @@ df = df.sample(fraction=0.1, seed=42)
 df = df.sample(withReplacement=False, fraction=0.1, seed=42)
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 3. Joining DataFrames
@@ -197,6 +203,8 @@ df = df1.subtract(df2)                                         # like EXCEPT DIS
 df = df1.exceptAll(df2)                                        # keeps duplicates
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 4. Aggregations
@@ -245,6 +253,8 @@ df = df.cube('region', 'country').agg(F.sum('sales'))
 # Count rows / distinct / nulls per column
 df.select([F.count(F.when(F.col(c).isNull(), c)).alias(c) for c in df.columns]).show()
 ```
+
+[↑ Back to contents](#contents)
 
 ---
 
@@ -303,6 +313,8 @@ df = df.withColumn('new_session', (F.col('gap_sec') > 1800).cast('int'))
 df = df.withColumn('session_id', F.sum(F.coalesce('new_session', F.lit(0))).over(w))
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 6. Conditional Statements
@@ -330,6 +342,8 @@ df = df.withColumn('flag', F.when(cond, 1).otherwise(0))
 # Greatest / least across columns
 df = df.withColumn('mx', F.greatest('a', 'b', 'c')).withColumn('mn', F.least('a', 'b', 'c'))
 ```
+
+[↑ Back to contents](#contents)
 
 ---
 
@@ -370,6 +384,8 @@ df = df.withColumn('b64', F.base64(F.col('column').cast('binary')))
 df = df.withColumn('fmt', F.format_string('%s-%05d', F.col('a'), F.col('b')))
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 8. Number Functions
@@ -401,6 +417,8 @@ from pyspark.sql.types import IntegerType
 df = df.withColumn('int_col', F.col('column').cast(IntegerType()))
 # NOTE: a failed cast returns NULL (unless spark.sql.ansi.enabled=true, which raises an error)
 ```
+
+[↑ Back to contents](#contents)
 
 ---
 
@@ -459,6 +477,8 @@ spark.conf.set('spark.sql.session.timeZone', 'UTC')                    # set ses
 df = df.groupBy(F.window('ts_col', '15 minutes')).count()
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 10. Column Operations
@@ -510,6 +530,8 @@ df = df.withColumn('row_id', F.monotonically_increasing_id())  # unique, NOT con
 num_cols = [c for c, t in df.dtypes if t in ('int', 'bigint', 'double') or t.startswith('decimal')]
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 11. Write Data
@@ -554,6 +576,8 @@ df.write.bucketBy(16, 'id').sortBy('id').saveAsTable('db.bucketed_tbl')
 # CSV write options
 df.write.option('header', True).option('delimiter', '|').option('quote', '"').csv(path)
 ```
+
+[↑ Back to contents](#contents)
 
 ---
 
@@ -647,6 +671,8 @@ def flatten_structs(df):
     return df.select(cols)
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 13. Null Handling & Data Quality
@@ -698,6 +724,8 @@ if missing:
     raise ValueError(f'Missing columns: {missing}')
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 14. Spark SQL
@@ -744,6 +772,8 @@ df = df.selectExpr('id', "CASE WHEN amount > 100 THEN 'big' ELSE 'small' END AS 
 df = df.filter(F.expr('amount > 100 AND status IN ("A","B")'))
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 15. UDFs
@@ -782,6 +812,8 @@ spark.conf.set('spark.sql.execution.arrow.pyspark.enabled', 'true')
 # UDF gotchas: handle None inside the function, declare the right return type,
 # and keep UDFs deterministic (the optimizer may call them more than once)
 ```
+
+[↑ Back to contents](#contents)
 
 ---
 
@@ -856,6 +888,8 @@ joined = big.join(small, ['key', 'salt']).drop('salt')
 # spark.serializer=org.apache.spark.serializer.KryoSerializer
 # spark.sql.broadcastTimeout, spark.network.timeout (for slow stages)
 ```
+
+[↑ Back to contents](#contents)
 
 ---
 
@@ -971,6 +1005,8 @@ spark.sql("CALL glue.system.expire_snapshots(table => 'db.tbl', older_than => TI
 | Incremental reads | Change data feed | Native incremental query | Incremental snapshots |
 | Strength | Spark / Databricks ecosystem | Record-level upserts, streaming ingestion | Engine-neutral, hidden partitioning |
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 18. CDC & SCD Patterns
@@ -1031,6 +1067,8 @@ incr = spark.read.jdbc(url, f"(SELECT * FROM src WHERE updated_at > '{last_wm}')
 # std/silver   -> typed, deduped, validated, conformed schema
 # curated/gold -> business-ready aggregates and dimensional models
 ```
+
+[↑ Back to contents](#contents)
 
 ---
 
@@ -1093,6 +1131,8 @@ spark.streams.active
 # Rules: never share a checkpoint between jobs; changing aggregations / schema may require a new checkpoint
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 20. JDBC, Redshift & S3
@@ -1146,6 +1186,8 @@ spark.conf.set('spark.hadoop.fs.s3a.connector.name', 's3a')    # if needed in OS
 # - Use IAM roles, not access keys in code
 # - Commit protocols: EMRFS S3-optimized committer (EMR); S3A magic committer (OSS)
 ```
+
+[↑ Back to contents](#contents)
 
 ---
 
@@ -1212,6 +1254,8 @@ sink.writeFrame(dyf)
 # Pass job params with --key value, read them via getResolvedOptions (e.g. Airflow passing run_date)
 # Glue Catalog = Hive metastore for Athena, Redshift Spectrum, EMR
 ```
+
+[↑ Back to contents](#contents)
 
 ---
 
@@ -1299,6 +1343,8 @@ df = (df.withColumn('load_ts', F.current_timestamp())
 | `withColumn` in a long loop | Use `select` / `withColumns` (huge plans slow analysis) |
 | `count()` used just to test emptiness | Use `df.isEmpty()` (3.3+) or `len(df.take(1)) == 0` |
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 23. Ending Spark
@@ -1318,6 +1364,8 @@ spark.stop()
 # In Glue: call job.commit() BEFORE the script ends; avoid spark.stop() before commit
 ```
 
+[↑ Back to contents](#contents)
+
 ---
 
 ## 24. Real-World Practice Scenarios
@@ -1327,18 +1375,22 @@ Each scenario lists the cheat-sheet sections it draws on. Difficulty: 🟢 easy,
 
 | # | Scenario | Level | Skills practiced |
 |---|---|---|---|
-| 1 | Collapse a CDC feed to current state | 🟢 | Windows, dedupe, delete handling (5, 18) |
-| 2 | Sessionize clickstream events | 🟡 | `lag`, running sum, aggregation (5, 9) |
-| 3 | Flatten nested JSON orders | 🟡 | `from_json`, `explode_outer`, structs (12) |
-| 4 | Upsert customers into a Hudi table (SCD1) | 🟡 | Hudi options, precombine, idempotency (17, 18) |
-| 5 | Build an SCD2 customer dimension | 🔴 | Hash diff, MERGE, staged updates (17, 18) |
-| 6 | Fix a skewed join | 🔴 | Skew detection, AQE, broadcast, salting (3, 16) |
-| 7 | Compact the small-files problem | 🟡 | `repartition`, `maxRecordsPerFile`, safe overwrite (11, 16) |
-| 8 | Data quality gate with quarantine | 🟡 | Rule flags, reject table, thresholds (13, 22) |
-| 9 | Incremental load that is safe to re-run | 🔴 | Watermarks, idempotent writes, partition design (11, 18, 22) |
-| 10 | Longest login streak per user | 🟡 | Gaps-and-islands technique (5, 9) |
+| 1 | [Collapse a CDC feed to current state](#scenario-1) | 🟢 | Windows, dedupe, delete handling (5, 18) |
+| 2 | [Sessionize clickstream events](#scenario-2) | 🟡 | `lag`, running sum, aggregation (5, 9) |
+| 3 | [Flatten nested JSON orders](#scenario-3) | 🟡 | `from_json`, `explode_outer`, structs (12) |
+| 4 | [Upsert customers into a Hudi table (SCD1)](#scenario-4) | 🟡 | Hudi options, precombine, idempotency (17, 18) |
+| 5 | [Build an SCD2 customer dimension](#scenario-5) | 🔴 | Hash diff, MERGE, staged updates (17, 18) |
+| 6 | [Fix a skewed join](#scenario-6) | 🔴 | Skew detection, AQE, broadcast, salting (3, 16) |
+| 7 | [Compact the small-files problem](#scenario-7) | 🟡 | `repartition`, `maxRecordsPerFile`, safe overwrite (11, 16) |
+| 8 | [Data quality gate with quarantine](#scenario-8) | 🟡 | Rule flags, reject table, thresholds (13, 22) |
+| 9 | [Incremental load that is safe to re-run](#scenario-9) | 🔴 | Watermarks, idempotent writes, partition design (11, 18, 22) |
+| 10 | [Longest login streak per user](#scenario-10) | 🟡 | Gaps-and-islands technique (5, 9) |
+
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
 
 ---
+
+<a id="scenario-1"></a>
 
 ### Scenario 1: Collapse a CDC feed to current state 🟢
 
@@ -1390,7 +1442,11 @@ deleted_ids.show()
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
+
+<a id="scenario-2"></a>
 
 ### Scenario 2: Sessionize clickstream events 🟡
 
@@ -1441,7 +1497,11 @@ summary.orderBy('user_id', 'session_start').show(truncate=False)
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
+
+<a id="scenario-3"></a>
 
 ### Scenario 3: Flatten nested JSON orders 🟡
 
@@ -1490,7 +1550,11 @@ order_totals.show()
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
+
+<a id="scenario-4"></a>
 
 ### Scenario 4: Upsert customers into a Hudi table (SCD1) 🟡
 
@@ -1540,7 +1604,11 @@ assert result.count() == result.select('customer_id').distinct().count()    # on
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
+
+<a id="scenario-5"></a>
 
 ### Scenario 5: Build an SCD2 customer dimension 🔴
 
@@ -1594,7 +1662,11 @@ spark.sql("SELECT id, COUNT(*) FROM dim_customer WHERE is_current GROUP BY id HA
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
+
+<a id="scenario-6"></a>
 
 ### Scenario 6: Fix a skewed join 🔴
 
@@ -1651,7 +1723,11 @@ result = hot_joined.unionByName(rest_joined)      # plus no_key_out from step 3 
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
+
+<a id="scenario-7"></a>
 
 ### Scenario 7: Compact the small-files problem 🟡
 
@@ -1696,7 +1772,11 @@ After validating row counts match between source and destination for that `dt`, 
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
+
+<a id="scenario-8"></a>
 
 ### Scenario 8: Data quality gate with quarantine 🟡
 
@@ -1762,7 +1842,11 @@ good.write.mode('overwrite').parquet('s3://my-bucket/curated/orders/')
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
+
+<a id="scenario-9"></a>
 
 ### Scenario 9: Incremental load that is safe to re-run 🔴
 
@@ -1811,7 +1895,11 @@ if new_wm is not None:
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
+
+<a id="scenario-10"></a>
 
 ### Scenario 10: Longest login streak per user 🟡
 
@@ -1861,6 +1949,8 @@ best.show()
 
 </details>
 
+[↑ Back to scenarios](#24-real-world-practice-scenarios) · [↑ Contents](#contents)
+
 ---
 
 ### Extra practice ideas
@@ -1874,6 +1964,8 @@ best.show()
 | Redshift staging upsert | Write Parquet to S3, `COPY` into staging, then delete + insert in one transaction | 20 |
 | Glue job with bookmarks | Incremental S3 ingestion using `transformation_ctx`, then verify a rerun processes nothing new | 21 |
 | Unit-test a transform | Pytest fixture with a local `SparkSession` and `assertDataFrameEqual` for the dedupe function | 22 |
+
+[↑ Back to contents](#contents)
 
 ---
 
